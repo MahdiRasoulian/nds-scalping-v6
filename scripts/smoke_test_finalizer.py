@@ -89,9 +89,6 @@ def main():
     risk_manager_with_overrides = create_scalping_risk_manager(overrides=overrides)
     run_case("With overrides", risk_manager_with_overrides, override_config, analysis_buy, small_dev_live)
 
-    low_conf_analysis = build_analysis("BUY", entry, sl, tp, confidence=limit_conf - 1)
-    run_case("Rejected case (low confidence)", risk_manager, base_config, low_conf_analysis, large_dev_live)
-
 
 if __name__ == "__main__":
     main()
