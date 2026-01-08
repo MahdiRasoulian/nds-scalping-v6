@@ -19,6 +19,8 @@ from collections import deque
 
 logger = logging.getLogger(__name__)
 
+from src.trading_bot.contracts import normalize_position
+
 @dataclass
 class ConnectionConfig:
     """تنظیمات اتصال MT5"""
@@ -852,6 +854,7 @@ class MT5Client:
     """)
 
 
+            request_comment = comment or "NDS_SCALP_V1"
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": symbol,
@@ -862,11 +865,12 @@ class MT5Client:
                 "tp": take_profit,
                 "deviation": 10,
                 "magic": 202401,
-                "comment": "NDS_SCALP_V1",
+                "comment": request_comment,
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": filling_type,
             }
 
+            request_time = datetime.now()
             result = mt5.order_send(request)
 
             if result is None:
@@ -880,21 +884,136 @@ class MT5Client:
                 self._logger.error(error_msg)
                 return {'error': error_msg, 'success': False, 'retcode': result.retcode}
 
+            order_ticket = getattr(result, "order", None)
+            position_ticket = self.resolve_position_ticket(
+                symbol=symbol,
+                magic=request.get("magic"),
+                comment=request_comment,
+                opened_after_time=request_time,
+                timeout_sec=5,
+            )
+
             return {
                 'success': True,
-                'ticket': result.order,
+                'order_ticket': order_ticket,
+                'position_ticket': position_ticket,
+                'ticket': position_ticket or order_ticket,
                 'entry_price': entry_price,
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'volume': volume,
                 'time': datetime.now(),
-                'comment': result.comment
+                'comment': result.comment,
+                'bid_at_entry': current_bid,
+                'ask_at_entry': current_ask,
             }
 
         except Exception as e:
             error_msg = f"Real-Time order error: {e}"
             self._logger.error(error_msg)
             return {'error': error_msg, 'success': False}
+
+    def resolve_position_ticket(
+        self,
+        symbol: str,
+        magic: Optional[int],
+        comment: Optional[str],
+        opened_after_time: datetime,
+        timeout_sec: int = 5,
+    ) -> Optional[int]:
+        """تلاش برای یافتن position_ticket بعد از ارسال سفارش."""
+        if not self.connected:
+            return None
+
+        deadline = time.time() + timeout_sec
+        matched_positions: List[Any] = []
+
+        while time.time() < deadline:
+            try:
+                positions = mt5.positions_get(symbol=symbol)
+                if positions:
+                    matched_positions = [
+                        pos for pos in positions
+                        if (magic is None or pos.magic == magic)
+                        and (comment is None or (pos.comment or "").strip() == comment.strip())
+                    ]
+                    if matched_positions:
+                        break
+            except Exception:
+                matched_positions = []
+
+            time.sleep(0.5)
+
+        if not matched_positions:
+            return None
+
+        def _pos_time(pos_obj: Any) -> datetime:
+            try:
+                return datetime.fromtimestamp(pos_obj.time)
+            except Exception:
+                return datetime.min
+
+        newest = max(matched_positions, key=_pos_time)
+        pos_time = _pos_time(newest)
+        if pos_time < opened_after_time - timedelta(seconds=2):
+            return None
+        return int(newest.ticket)
+
+    def get_position_history(self, position_ticket: int, days_back: int = 2) -> Dict[str, Any]:
+        """دریافت تاریخچه معاملات برای یک position_ticket جهت تایید بسته شدن."""
+        if not self.connected:
+            self._logger.warning("⚠️ Not connected to MT5")
+            return {}
+
+        try:
+            now = datetime.now()
+            from_time = now - timedelta(days=days_back)
+            deals = mt5.history_deals_get(from_time, now)
+            if deals is None:
+                error = mt5.last_error()
+                self._logger.warning(f"⚠️ Failed to get deals history: {error}")
+                return {}
+
+            position_deals = []
+            for deal in deals:
+                deal_position_id = getattr(deal, "position_id", None)
+                deal_position = getattr(deal, "position", None)
+                if deal_position_id == position_ticket or deal_position == position_ticket:
+                    position_deals.append(deal)
+
+            if not position_deals:
+                return {}
+
+            total_profit = 0.0
+            exit_price = None
+            close_time = None
+            volume_closed = 0.0
+            reason = "Manual/Other"
+
+            for deal in position_deals:
+                total_profit += float(getattr(deal, "profit", 0.0) or 0.0)
+                entry_flag = getattr(deal, "entry", None)
+                if entry_flag in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_INOUT", None)):
+                    exit_price = float(getattr(deal, "price", 0.0) or 0.0)
+                    close_time = datetime.fromtimestamp(getattr(deal, "time", 0))
+                    volume_closed += float(getattr(deal, "volume", 0.0) or 0.0)
+
+                comment = (getattr(deal, "comment", "") or "").lower()
+                if "tp" in comment or "sl" in comment:
+                    reason = "TP/SL"
+
+            return {
+                "position_ticket": position_ticket,
+                "total_profit": total_profit,
+                "exit_price": exit_price,
+                "close_time": close_time,
+                "volume_closed": volume_closed,
+                "reason": reason,
+            }
+
+        except Exception as e:
+            self._logger.error(f"❌ Error getting position history: {e}", exc_info=True)
+            return {}
 
     
     def send_order(self, symbol: str, order_type: str, volume: float, 
@@ -1363,9 +1482,9 @@ class MT5Client:
                 self._logger.debug(f"📊 No open positions found for {symbol if symbol else 'all symbols'}")
                 return []
             
-            result = []
+            result: List[Dict[str, Any]] = []
             for pos in positions:
-                position_info = {
+                raw_info = {
                     'ticket': pos.ticket,
                     'symbol': pos.symbol,
                     'type': 'BUY' if pos.type == mt5.ORDER_TYPE_BUY else 'SELL',
@@ -1375,15 +1494,12 @@ class MT5Client:
                     'sl': pos.sl,
                     'tp': pos.tp,
                     'profit': pos.profit,
-                    'swap': getattr(pos, 'swap', 0.0),
-                    'commission': getattr(pos, 'commission', 0.0),
                     'magic': pos.magic,
                     'comment': pos.comment,
                     'time': datetime.fromtimestamp(pos.time),
                     'time_update': datetime.fromtimestamp(pos.time_update),
-                    'time_msc': datetime.fromtimestamp(pos.time_msc / 1000.0) if hasattr(pos, 'time_msc') and pos.time_msc > 0 else None,
                 }
-                result.append(position_info)
+                result.append(normalize_position(raw_info))
             
             self._logger.info(f"📊 Found {len(result)} open position(s) for {symbol if symbol else 'all symbols'}")
             return result

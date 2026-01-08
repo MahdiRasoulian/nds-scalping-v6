@@ -1,3 +1,4 @@
+import os
 import requests
 import logging
 import threading
@@ -10,8 +11,8 @@ logger = logging.getLogger(__name__)
 class TelegramNotifier:
     def __init__(self):
 
-            self.token = "8528114862:AAGfpVR-ytNUf0IwKHYRmvITV5EAuHFV-xQ"
-            self.chat_id = "-1003385933201"
+            self.token = os.getenv("TELEGRAM_BOT_TOKEN", "8528114862:AAGfpVR-ytNUf0IwKHYRmvITV5EAuHFV-xQ")
+            self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "-1003385933201")
             
             self.api_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
             

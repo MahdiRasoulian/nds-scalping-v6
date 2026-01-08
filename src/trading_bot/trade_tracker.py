@@ -1,14 +1,20 @@
 """Trade tracking utilities for NDS bot."""
 
-from datetime import datetime
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+
+from src.trading_bot.contracts import ExecutionEvent, PositionContract, TradeIdentity
 
 
 class TradeTracker:
     """ردیاب کامل معاملات از باز شدن تا بسته شدن"""
 
     def __init__(self):
-        self.active_trades = {}  # {ticket: {open_time, entry_price, volume, ...}}
-        self.closed_trades = []  # لیست معاملات بسته شده
+        self.active_trades: Dict[int, Dict] = {}
+        self.pending_trades_by_order: Dict[int, Dict] = {}
+        self.closed_trades: List[Dict] = []
         self.max_daily_profit = 0.0
         self.daily_stats = {
             'total_trades': 0,
@@ -16,83 +22,164 @@ class TradeTracker:
             'total_profit': 0.0
         }
 
-    def add_trade(self, ticket: int, entry_data: dict):
-        """ثبت معامله جدید"""
-        self.active_trades[ticket] = {
-            **entry_data,
-            'status': 'OPEN',
-            'open_time': datetime.now(),
-            'max_profit': 0.0,
-            'max_loss': 0.0,
-            'current_profit': 0.0,
-            'current_price': entry_data.get('entry_price', 0.0),
-            'last_update': datetime.now()
+    @property
+    def active_trades_view(self) -> Dict[int, Dict]:
+        return self.active_trades
+
+    def add_trade_open(self, event: ExecutionEvent) -> None:
+        """ثبت معامله جدید با رویداد OPEN"""
+        identity = TradeIdentity(
+            order_ticket=event.get("order_ticket"),
+            position_ticket=event.get("position_ticket"),
+            symbol=event.get("symbol") or "",
+            magic=event.get("metadata", {}).get("magic"),
+            comment=event.get("metadata", {}).get("comment"),
+            opened_at=event.get("event_time") or datetime.now(),
+            detected_by=event.get("metadata", {}).get("detected_by", "order_send"),
+        )
+
+        record = {
+            "trade_identity": identity,
+            "open_event": event,
+            "last_update_event": event,
+            "close_event": None,
+            "status": "OPEN",
         }
-        self.daily_stats['total_trades'] += 1
 
-    def update_trade(self, ticket: int, current_price: float, current_profit: float, mt5_client=None):
-        """بروزرسانی وضعیت معامله باز"""
-        if ticket in self.active_trades:
-            trade = self.active_trades[ticket]
+        if identity["position_ticket"]:
+            self.active_trades[int(identity["position_ticket"])] = record
+        elif identity["order_ticket"]:
+            self.pending_trades_by_order[int(identity["order_ticket"])] = record
 
-            # اگر قیمت یا سود صفر پاس داده شده باشد (نشانه بسته شدن از طرف مانیتورینگ)
-            # و در عین حال در MT5 هم پوزیشن نباشد، عملیات بستن را انجام بده
-            if current_price == 0.0 and current_profit == 0.0:
-                # استفاده از آخرین سود ثبت شده برای گزارش نهایی
-                final_p = trade.get('current_profit', 0.0)
-                self._close_trade_automatically(ticket, final_p)
-                return
+        if identity.get("detected_by") != "recovery_scan":
+            self.daily_stats['total_trades'] += 1
 
-            # بروزرسانی مقادیر لحظه‌ای
-            trade['current_price'] = current_price
-            trade['current_profit'] = current_profit
-            trade['last_update'] = datetime.now()
+    def update_trade_event(self, event: ExecutionEvent) -> None:
+        """به‌روزرسانی رویدادهای OPEN/UPDATE"""
+        position_ticket = event.get("position_ticket")
+        order_ticket = event.get("order_ticket")
 
-            # ثبت حداکثر سود/ضرر
-            trade['max_profit'] = max(trade['max_profit'], current_profit)
-            trade['max_loss'] = min(trade['max_loss'], current_profit)
+        if position_ticket and position_ticket in self.active_trades:
+            self.active_trades[position_ticket]["last_update_event"] = event
+            return
 
-            # --- بخش بهبود یافته ---
-            # به جای درخواست مجدد از MT5، از منطق مانیتورینگ bot.py تبعیت می‌کنیم.
-            # اگر لازم باشد از داخل اینجا هم چک شود، فقط به شرطی که لیست پوزیشن‌ها از قبل گرفته نشده باشد.
-            # اما طبق معماری جدید ما، نیازی به کدهای زیر نیست و کامنت می‌شوند تا سرعت بالا برود:
-            """
-            try:
-                positions = mt5_client.get_open_positions()
-                if positions:
-                    open_tickets = [p.get('ticket') for p in positions if p]
-                    if ticket not in open_tickets:
-                        self._close_trade_automatically(ticket, current_profit)
-            except:
-                pass
-            """
+        if order_ticket and order_ticket in self.pending_trades_by_order:
+            record = self.pending_trades_by_order[order_ticket]
+            if position_ticket:
+                record["trade_identity"]["position_ticket"] = position_ticket
+                self.active_trades[position_ticket] = record
+                del self.pending_trades_by_order[order_ticket]
+                self.active_trades[position_ticket]["last_update_event"] = event
+            else:
+                record["last_update_event"] = event
 
-    def _close_trade_automatically(self, ticket: int, final_profit: float):
-        """بستن خودکار معامله وقتی از MT5 حذف شده"""
-        if ticket in self.active_trades:
-            trade = self.active_trades[ticket]
-            trade.update({
-                'status': 'CLOSED',
-                'close_time': datetime.now(),
-                'close_profit': final_profit,
-                'final_profit': final_profit,
-                'close_reason': 'auto_detected'
-            })
+    def close_trade_event(self, event: ExecutionEvent) -> None:
+        """ثبت بسته شدن معامله"""
+        position_ticket = event.get("position_ticket")
+        if position_ticket not in self.active_trades:
+            return
 
-            self.closed_trades.append(trade)
+        trade = self.active_trades[position_ticket]
+        trade["close_event"] = event
+        trade["status"] = "CLOSED"
+        self.closed_trades.append(trade)
 
-            # آمار روزانه
-            self.daily_stats['total_profit'] += final_profit
-            if final_profit > 0:
-                self.daily_stats['winning_trades'] += 1
+        final_profit = float(event.get("profit") or 0.0)
+        self.daily_stats['total_profit'] += final_profit
+        if final_profit > 0:
+            self.daily_stats['winning_trades'] += 1
+        if final_profit > self.max_daily_profit:
+            self.max_daily_profit = final_profit
 
-            # حداکثر سود روزانه
-            if final_profit > self.max_daily_profit:
-                self.max_daily_profit = final_profit
+        del self.active_trades[position_ticket]
 
-            del self.active_trades[ticket]
-            return True
-        return False
+    def mark_trade_unknown(self, position_ticket: int, reason: str) -> None:
+        """علامت‌گذاری معامله برای بررسی مجدد در سیکل بعدی."""
+        if position_ticket in self.active_trades:
+            self.active_trades[position_ticket]["status"] = "UNKNOWN"
+            self.active_trades[position_ticket]["unknown_reason"] = reason
+
+    def reconcile_with_open_positions(
+        self, open_positions: List[PositionContract]
+    ) -> Tuple[int, int, List[Dict]]:
+        """همگام‌سازی وضعیت معاملات با پوزیشن‌های باز MT5."""
+        added_count = 0
+        updated_count = 0
+
+        open_map = {pos["position_ticket"]: pos for pos in open_positions}
+        unmatched_positions = set(open_map.keys())
+
+        # Resolve pending trades by matching metadata
+        for order_ticket, record in list(self.pending_trades_by_order.items()):
+            identity: TradeIdentity = record["trade_identity"]
+            for pos_ticket, position in open_map.items():
+                if pos_ticket not in unmatched_positions:
+                    continue
+                if position["symbol"] != identity["symbol"]:
+                    continue
+                if identity.get("magic") and position["magic"] != identity["magic"]:
+                    continue
+                if identity.get("comment") and position["comment"] != identity["comment"]:
+                    continue
+                opened_at = identity.get("opened_at", datetime.min)
+                if position["open_time"] < opened_at - timedelta(minutes=5):
+                    continue
+                record["trade_identity"]["position_ticket"] = pos_ticket
+                self.active_trades[pos_ticket] = record
+                del self.pending_trades_by_order[order_ticket]
+                unmatched_positions.discard(pos_ticket)
+                updated_count += 1
+                break
+
+        # Update active or add recovered positions
+        for pos_ticket, position in open_map.items():
+            if pos_ticket in self.active_trades:
+                update_event: ExecutionEvent = {
+                    "event_type": "UPDATE",
+                    "event_time": position["update_time"] or datetime.now(),
+                    "symbol": position["symbol"],
+                    "order_ticket": None,
+                    "position_ticket": pos_ticket,
+                    "side": position["side"],
+                    "volume": position["volume"],
+                    "entry_price": position["entry_price"],
+                    "exit_price": None,
+                    "sl": position["sl"],
+                    "tp": position["tp"],
+                    "profit": position["profit"],
+                    "pips": None,
+                    "reason": None,
+                    "metadata": {"current_price": position["current_price"]},
+                }
+                self.update_trade_event(update_event)
+                updated_count += 1
+            else:
+                open_event: ExecutionEvent = {
+                    "event_type": "OPEN",
+                    "event_time": position["open_time"],
+                    "symbol": position["symbol"],
+                    "order_ticket": None,
+                    "position_ticket": pos_ticket,
+                    "side": position["side"],
+                    "volume": position["volume"],
+                    "entry_price": position["entry_price"],
+                    "exit_price": None,
+                    "sl": position["sl"],
+                    "tp": position["tp"],
+                    "profit": position["profit"],
+                    "pips": None,
+                    "reason": None,
+                    "metadata": {"detected_by": "recovery_scan", "current_price": position["current_price"]},
+                }
+                self.add_trade_open(open_event)
+                added_count += 1
+
+        closed_candidates = []
+        for pos_ticket, record in self.active_trades.items():
+            if pos_ticket not in open_map:
+                closed_candidates.append(record)
+
+        return added_count, updated_count, closed_candidates
 
     def get_active_trades_count(self) -> int:
         """تعداد معاملات فعال"""
