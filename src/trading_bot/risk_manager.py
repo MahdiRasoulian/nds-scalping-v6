@@ -62,17 +62,19 @@ class ScalpingRiskManager:
         full_config = config.get_full_config()
         return self._merge_with_config(full_config, {})
     
-    def __init__(self, config: Dict = None, logger: logging.Logger = None):
+    def __init__(self, overrides: Optional[Dict[str, Any]] = None, logger: logging.Logger = None):
         """
         مقداردهی مدیر ریسک اسکلپینگ با ساختار یکپارچه و حرفه‌ای.
         
         Args:
-            config: دیکشنری تنظیمات خام (معمولاً از فایل JSON یا خروجی ConfigManager)
+            overrides: دیکشنری تنظیمات سفارشی برای بازنویسی مقادیر پایه
             logger: آبجکت لاگر برای ثبت وقایع
         """
         full_config = config.get_full_config()
-        if config:
-            for key, value in config.items():
+        if overrides is not None:
+            if not isinstance(overrides, dict):
+                raise TypeError("overrides must be a dict when provided.")
+            for key, value in overrides.items():
                 if isinstance(value, dict) and isinstance(full_config.get(key), dict):
                     full_config[key].update(value)
                 else:
@@ -82,7 +84,7 @@ class ScalpingRiskManager:
         # ۲. مقداردهی لاگر
         self._logger = logger or logging.getLogger(__name__)
         
-        self._logger.info("🔄 bot_config.json merged into RiskManager.")
+        self._logger.info("🔄 Single Source of Truth loaded for RiskManager (ConfigManager + overrides).")
 
         # ۴. ذخیره تنظیمات نهایی در self.settings (منبع واحد حقیقت)
         self.settings = merged_config
@@ -1074,18 +1076,28 @@ class ScalpingRiskManager:
 
 
 # تابع اصلی برای اسکلپینگ
-def create_scalping_risk_manager(config: Dict = None, **kwargs) -> ScalpingRiskManager:
+def create_scalping_risk_manager(overrides: Optional[Dict[str, Any]] = None, **kwargs) -> ScalpingRiskManager:
     """
     ایجاد مدیر ریسک اسکلپینگ
     
     Args:
-        config: دیکشنری تنظیمات
+        overrides: دیکشنری تنظیمات سفارشی
         **kwargs: پارامترهای اضافی
     
     Returns:
         ScalpingRiskManager: نمونه ایجاد شده
     """
-    return ScalpingRiskManager(config=config, **kwargs)
+    if "config" in kwargs:
+        config_override = kwargs.pop("config")
+        if not isinstance(config_override, dict):
+            raise TypeError("config must be a dict when passed for backward compatibility.")
+        if overrides is None:
+            overrides = config_override
+        else:
+            merged_overrides = dict(config_override)
+            merged_overrides.update(overrides)
+            overrides = merged_overrides
+    return ScalpingRiskManager(overrides=overrides, **kwargs)
 
 
 # تست عملکرد
@@ -1116,7 +1128,7 @@ if __name__ == "__main__":
     }
     
     # ایجاد مدیر ریسک اسکلپینگ
-    srm = ScalpingRiskManager(config=test_config)
+    srm = ScalpingRiskManager(overrides=test_config)
     
     # تست محاسبه حجم اسکلپینگ
     params = srm.calculate_scalping_position_size(

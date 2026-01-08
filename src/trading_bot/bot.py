@@ -190,7 +190,7 @@ class NDSBot:
                     'real_time_enabled': True
                 })
                 
-                self.risk_manager = create_scalping_risk_manager(config=scalping_config)
+                self.risk_manager = create_scalping_risk_manager(overrides=scalping_config)
                 
                 logger.info("✅ ربات با موفقیت عملیاتی شد.")
                 
