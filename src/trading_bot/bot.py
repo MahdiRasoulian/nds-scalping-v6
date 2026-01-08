@@ -4,13 +4,10 @@
 """
 
 import sys
-import os
 import time
 import signal
 import atexit
 import logging
-import json
-import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -54,8 +51,12 @@ except ImportError as e:
     sys.exit(1)
 
 from src.trading_bot.state import BotState
+from src.trading_bot.execution_reporting import generate_execution_report
 from src.trading_bot.nds.models import LivePriceSnapshot
-from src.ui.cli import print_banner, print_help, get_user_input, update_config_interactive
+from src.trading_bot.realtime_price import RealTimePriceMonitor
+from src.trading_bot.trade_tracker import TradeTracker
+from src.trading_bot.user_controls import UserControls
+from src.ui.cli import print_banner, print_help, update_config_interactive
 
 # ایمپورت آنالایزر جدید به صورت ماژولار
 try:
@@ -78,121 +79,6 @@ bot_state_global = None
 
 
 
-class TradeTracker:
-    """ردیاب کامل معاملات از باز شدن تا بسته شدن"""
-    
-    def __init__(self):
-        self.active_trades = {}  # {ticket: {open_time, entry_price, volume, ...}}
-        self.closed_trades = []  # لیست معاملات بسته شده
-        self.max_daily_profit = 0.0
-        self.daily_stats = {
-            'total_trades': 0,
-            'winning_trades': 0,
-            'total_profit': 0.0
-        }
-    
-    def add_trade(self, ticket: int, entry_data: dict):
-        """ثبت معامله جدید"""
-        self.active_trades[ticket] = {
-            **entry_data,
-            'status': 'OPEN',
-            'open_time': datetime.now(),
-            'max_profit': 0.0,
-            'max_loss': 0.0,
-            'current_profit': 0.0,
-            'current_price': entry_data.get('entry_price', 0.0),
-            'last_update': datetime.now()
-        }
-        self.daily_stats['total_trades'] += 1
-    
-    def update_trade(self, ticket: int, current_price: float, current_profit: float, mt5_client=None):
-        """بروزرسانی وضعیت معامله باز"""
-        if ticket in self.active_trades:
-            trade = self.active_trades[ticket]
-            
-            # اگر قیمت یا سود صفر پاس داده شده باشد (نشانه بسته شدن از طرف مانیتورینگ)
-            # و در عین حال در MT5 هم پوزیشن نباشد، عملیات بستن را انجام بده
-            if current_price == 0.0 and current_profit == 0.0:
-                # استفاده از آخرین سود ثبت شده برای گزارش نهایی
-                final_p = trade.get('current_profit', 0.0)
-                self._close_trade_automatically(ticket, final_p)
-                return
-
-            # بروزرسانی مقادیر لحظه‌ای
-            trade['current_price'] = current_price
-            trade['current_profit'] = current_profit
-            trade['last_update'] = datetime.now()
-            
-            # ثبت حداکثر سود/ضرر
-            trade['max_profit'] = max(trade['max_profit'], current_profit)
-            trade['max_loss'] = min(trade['max_loss'], current_profit)
-            
-            # --- بخش بهبود یافته ---
-            # به جای درخواست مجدد از MT5، از منطق مانیتورینگ bot.py تبعیت می‌کنیم.
-            # اگر لازم باشد از داخل اینجا هم چک شود، فقط به شرطی که لیست پوزیشن‌ها از قبل گرفته نشده باشد.
-            # اما طبق معماری جدید ما، نیازی به کدهای زیر نیست و کامنت می‌شوند تا سرعت بالا برود:
-            """
-            try:
-                positions = mt5_client.get_open_positions()
-                if positions:
-                    open_tickets = [p.get('ticket') for p in positions if p]
-                    if ticket not in open_tickets:
-                        self._close_trade_automatically(ticket, current_profit)
-            except:
-                pass
-            """
-    
-    def _close_trade_automatically(self, ticket: int, final_profit: float):
-        """بستن خودکار معامله وقتی از MT5 حذف شده"""
-        if ticket in self.active_trades:
-            trade = self.active_trades[ticket]
-            trade.update({
-                'status': 'CLOSED',
-                'close_time': datetime.now(),
-                'close_profit': final_profit,
-                'final_profit': final_profit,
-                'close_reason': 'auto_detected'
-            })
-            
-            self.closed_trades.append(trade)
-            
-            # آمار روزانه
-            self.daily_stats['total_profit'] += final_profit
-            if final_profit > 0:
-                self.daily_stats['winning_trades'] += 1
-            
-            # حداکثر سود روزانه
-            if final_profit > self.max_daily_profit:
-                self.max_daily_profit = final_profit
-            
-            del self.active_trades[ticket]
-            return True
-        return False
-    
-    def get_active_trades_count(self) -> int:
-        """تعداد معاملات فعال"""
-        return len(self.active_trades)
-    
-    def get_daily_stats(self) -> dict:
-        """آمار روزانه"""
-        win_rate = 0
-        if self.daily_stats['total_trades'] > 0:
-            win_rate = (self.daily_stats['winning_trades'] / self.daily_stats['total_trades']) * 100
-        
-        return {
-            **self.daily_stats,
-            'win_rate': win_rate,
-            'max_daily_profit': self.max_daily_profit,
-            'active_trades': self.get_active_trades_count(),
-            'closed_trades': len(self.closed_trades)
-        }
-
-
-
-
-
-
-
 
 class NDSBot:
     """
@@ -209,11 +95,6 @@ class NDSBot:
         self.MT5Client_cls = mt5_client_cls
         self.RiskManager_cls = risk_manager_cls  # اختیاری برای سازگاری با اسکلپینگ
         
-        # 🔥 متغیرهای Real-Time
-        self.real_time_prices = {}  # کش قیمت‌های لحظه‌ای
-        self.last_tick_time = {}   # زمان آخرین دریافت تیک
-        self.price_monitor_thread = None  # ترد مانیتورینگ قیمت
-        
         # استفاده از تابع تحلیل ماژولار (اگر analyze_func مشخص نشده)
         if analyze_func is None:
             self.analyze_market_func = analyze_gold_market  # ✅ استفاده از تابع ماژولار
@@ -225,122 +106,13 @@ class NDSBot:
         self.config = config
         self.analyzer_config = None
 
+        self.price_monitor = RealTimePriceMonitor(config=self.config, bot_state=self.bot_state, logger=logger)
         self.trade_tracker = TradeTracker()
+        self.user_controls = UserControls(self, logger)
 
         self.notifier = TelegramNotifier()
     
-    def _start_real_time_price_monitor(self):
-        """🔥 شروع مانیتورینگ Real-Time قیمت‌ها"""
-        if not self.mt5_client or not self.mt5_client.connected:
-            logger.warning("⚠️ Cannot start Real-Time monitor: MT5 not connected")
-            return
-            
-        try:
-            # بررسی اینکه آیا MT5 Client نسخه Real-Time است
-            if hasattr(self.mt5_client, 'real_time_monitor'):
-                if self.mt5_client.real_time_monitor:
-                    logger.info("✅ Real-Time monitor already active")
-                    return
-                
-                # شروع مانیتورینگ
-                self.mt5_client.real_time_monitor.start()
-                logger.info("🎯 Real-Time Price Monitor Started")
-            else:
-                # 🔧 اگر نسخه قدیمی است، ترد جداگانه ایجاد کن
-                self._start_legacy_price_monitor()
-                
-        except Exception as e:
-            logger.error(f"❌ Error starting Real-Time monitor: {e}")
     
-    def _start_legacy_price_monitor(self):
-        """🔥 مانیتورینگ Real-Time برای نسخه‌های قدیمی MT5 Client"""
-        def monitor_loop():
-            logger.info("🔄 Legacy Real-Time Monitor started")
-            while self.bot_state.is_running and self.mt5_client and self.mt5_client.connected:
-                try:
-                    # مانیتورینگ قیمت نماد اصلی
-                    symbol = self.config.get('trading_settings.SYMBOL')
-                    tick = self.mt5_client.get_current_tick(symbol)
-                    
-                    if tick:
-                        self.real_time_prices[symbol] = {
-                            'bid': tick['bid'],
-                            'ask': tick['ask'],
-                            'last': tick['last'],
-                            'time': tick['time'],
-                            'spread': tick['spread']
-                        }
-                        self.last_tick_time[symbol] = datetime.now()
-                        
-                        # هر 30 ثانیه لاگ کن (برای جلوگیری از spam)
-                        current_time = datetime.now()
-                        if (current_time - getattr(self, '_last_price_log', datetime.min)).seconds >= 30:
-                            logger.debug(f"📊 Real-Time Price: {symbol} - Bid: {tick['bid']:.2f}, Ask: {tick['ask']:.2f}, Spread: {tick['spread']:.2f}")
-                            self._last_price_log = current_time
-                    
-                    time.sleep(1)  # هر 1 ثانیه چک کن
-                    
-                except Exception as e:
-                    logger.error(f"Real-Time monitor error: {e}")
-                    time.sleep(5)
-            
-            logger.info("⏹️ Legacy Real-Time Monitor stopped")
-        
-        # شروع ترد مانیتورینگ
-        self.price_monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-        self.price_monitor_thread.start()
-    
-    def get_current_price(self, symbol: str) -> Dict[str, Any]:
-        """🔥 دریافت قیمت لحظه‌ای از کش یا دریافت مستقیم"""
-        try:
-            # اولویت 1: از کش Real-Time
-            if symbol in self.real_time_prices:
-                price_data = self.real_time_prices[symbol]
-                # بررسی کهنه نبودن داده‌ها (حداکثر 3 ثانیه)
-                if self.last_tick_time.get(symbol):
-                    age = (datetime.now() - self.last_tick_time[symbol]).total_seconds()
-                    if age < 3:
-                        return {
-                            **price_data,
-                            'source': 'real_time_cache',
-                            'age_seconds': age
-                        }
-            
-            # اولویت 2: از MT5 Client
-            if self.mt5_client and self.mt5_client.connected:
-                tick = self.mt5_client.get_current_tick(symbol)
-                if tick:
-                    return {
-                        'bid': tick.get('bid', 0),
-                        'ask': tick.get('ask', 0),
-                        'last': tick.get('last', 0),
-                        'time': tick.get('time', datetime.now()),
-                        'spread': tick.get('spread', 0),
-                        'source': 'direct_fetch'
-                    }
-            
-            # اولویت 3: از داده‌های تاریخی
-            return {
-                'bid': 0,
-                'ask': 0,
-                'last': 0,
-                'time': datetime.now(),
-                'spread': 0,
-                'source': 'no_data',
-                'error': 'No price data available'
-            }
-            
-        except Exception as e:
-            logger.error(f"Error getting current price: {e}")
-            return {
-                'bid': 0,
-                'ask': 0,
-                'last': 0,
-                'time': datetime.now(),
-                'spread': 0,
-                'source': 'error',
-                'error': str(e)
-            }
     
     def initialize(self) -> bool:
             """🔥 مقداردهی اولیه ربات و اتصال به سرویس‌ها (نسخه Real-Time حرفه‌ای)"""
@@ -385,7 +157,8 @@ class NDSBot:
                     logger.info(f"💰 حساب متصل شد | موجودی لحظه‌ای: ${current_equity:,.2f}")
                 
                 # 🔥 3. شروع مانیتورینگ قیمت لحظه‌ای
-                self._start_real_time_price_monitor()
+                self.price_monitor.set_mt5_client(self.mt5_client)
+                self.price_monitor.start()
                 
                 # 4. آماده‌سازی هوشمند آنالایزر (تطبیق با نتایج بکتست موفق)
                 logger.info("🧠 در حال هماهنگ‌سازی تنظیمات آنالایزر با استراتژی SMC...")
@@ -396,12 +169,17 @@ class NDSBot:
                     self.analyzer_config['ANALYZER_SETTINGS'] = self.config.get('technical_settings')
 
                 # تزریق پارامترهای بهینه شده بکتست به صورت داینامیک
-                tech_settings = self.analyzer_config['ANALYZER_SETTINGS']
-                tech_settings.update({
+                tech_settings = self.analyzer_config.get('ANALYZER_SETTINGS', {})
+                analyzer_settings = {
+                    **tech_settings,
                     'ADX_THRESHOLD_WEAK': self.config.get('technical_settings.ADX_THRESHOLD_WEAK'),
                     'REAL_TIME_ENABLED': True,
                     'USE_CURRENT_PRICE_FOR_ANALYSIS': True
-                })
+                }
+                self.analyzer_config = {
+                    **self.analyzer_config,
+                    'ANALYZER_SETTINGS': analyzer_settings
+                }
                 
                 # 5. ایجاد مدیر ریسک (Risk Manager)
                 scalping_config = self.config.get_risk_manager_config()
@@ -433,7 +211,7 @@ class NDSBot:
         """🔥 گزارش وضعیت واقعی و داینامیک سیستم (بدون مقادیر Fixed)"""
         try:
             symbol = self.config.get('trading_settings.SYMBOL')
-            current_price = self.get_current_price(symbol)
+            current_price = self.price_monitor.get_current_price(symbol)
             
             # استخراج مقادیر واقعی از کانتستنت‌ها و وضعیت جاری
             conn_status = "✅ Connected" if self.mt5_client and self.mt5_client.connected else "❌ Disconnected"
@@ -763,7 +541,7 @@ class NDSBot:
         
         try:
             # 🔥 دریافت قیمت Real-Time قبل از هر چیز
-            current_price_data = self.get_current_price(SYMBOL)
+            current_price_data = self.price_monitor.get_current_price(SYMBOL)
             
             if current_price_data.get('source') in ['no_data', 'error']:
                 logger.error(f"❌ نمی‌توان قیمت Real-Time را دریافت کرد: {current_price_data.get('error', 'Unknown error')}")
@@ -844,6 +622,10 @@ class NDSBot:
             )
             logger.info(decision_summary)
             print(f"✅ {decision_summary}")
+            if finalized.decision_notes:
+                notes_text = " | ".join(finalized.decision_notes)
+                logger.info(f"Decision Notes: {notes_text}")
+                print(f"📝 {notes_text}")
 
             # 🔥 ارسال سفارش بر اساس تصمیم نهایی RiskManager
             logger.info(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر: {signal_data['signal']} {lot_size:.3f} لات")
@@ -970,113 +752,23 @@ class NDSBot:
                     self.risk_manager.add_position(lot_size)
                 
                 # 🔥 سیستم گزارش‌گیری اسکلپینگ با داده‌های Real-Time
-                try:
-                    # استفاده از قیمت‌های واقعی اجرا شده
-                    execution_entry_price = signal_data.get('actual_entry_price', finalized.entry_price)
-                    execution_stop_loss = signal_data.get('actual_stop_loss', finalized.stop_loss)
-                    execution_take_profit = signal_data.get('actual_take_profit', finalized.take_profit)
-                    planned_stop_loss = signal_data.get('stop_loss', finalized.stop_loss)
-                    planned_take_profit = signal_data.get('take_profit', finalized.take_profit)
-                    planned_entry = signal_data.get('entry_price', finalized.entry_price)
-                    
-                    # محاسبه session_multiplier
-                    session_multiplier = 1.0
-                    if hasattr(self.risk_manager, 'get_scalping_multiplier'):
-                        session_multiplier = self.risk_manager.get_scalping_multiplier(current_session or 'N/A')
-                    
-                    execution_report = {
-                        'order_id': order_id,
-                        'symbol': SYMBOL,
-                        'signal': signal_data['signal'],
-                        'order_type': order_type,  # اضافه کردن نوع سفارش
-                        'entry_price_planned': planned_entry,
-                        'entry_price_actual': execution_entry_price,
-                        'stop_loss_planned': planned_stop_loss,
-                        'stop_loss_actual': execution_stop_loss,
-                        'take_profit_planned': planned_take_profit,
-                        'take_profit_actual': execution_take_profit,
-                        'lot_size': lot_size,
-                        'confidence': signal_data.get('confidence', 0),
-                        'execution_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'scalping_params': {},
-                        'risk_params': {
-                            'risk_amount': finalized.risk_amount_usd,
-                            'risk_percent': None,
-                            'actual_risk_percent': None,
-                            'sl_distance': abs(finalized.entry_price - finalized.stop_loss),
-                            'scalping_grade': scalping_grade,
-                            'max_holding_minutes': 60,
-                            'session': current_session or 'N/A',
-                            'session_multiplier': session_multiplier
-                        },
-                        'timeframe': TIMEFRAME,
-                        'signal_quality': signal_data.get('quality', 'MEDIUM'),
-                        'scalping_mode': True,
-                        'market_metrics': market_metrics,
-                        'real_time_data': {
-                            'bid_at_analysis': current_price_data.get('bid'),
-                            'ask_at_analysis': current_price_data.get('ask'),
-                            'bid_at_execution': signal_data.get('execution_bid'),
-                            'ask_at_execution': signal_data.get('execution_ask'),
-                            'price_deviation_pips': price_deviation_pips,
-                            'execution_source': current_price_data.get('source', 'unknown')
-                        }
-                    }
-                    
-                    # ذخیره فایل JSON
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    execution_file = f"trade_reports/scalping_executions/{SYMBOL}_scalping_{timestamp}.json"
-                    Path("trade_reports/scalping_executions").mkdir(parents=True, exist_ok=True)
-                    
-                    with open(execution_file, 'w', encoding='utf-8') as f:
-                        json.dump(execution_report, f, indent=2, ensure_ascii=False)
-                    
-                    logger.info(f"📝 گزارش خام معامله اسکلپینگ Real-Time در {execution_file} ذخیره شد")
-                    print(f"📝 گزارش خام معامله اسکلپینگ ذخیره شد")
-                    
-                    # 🔥 تولید گزارش کامل با مقایسه تحلیل و اجرا
-                    try:
-                        from src.reporting.report_generator import ReportGenerator
-                        if df is not None:
-                            report_gen = ReportGenerator(output_dir="trade_reports/scalping_reports")
-                            
-                            order_details = {
-                                'signal': signal_data['signal'],
-                                'side': signal_data['signal'],
-                                'confidence': signal_data.get('confidence', 0),
-                                'entry_planned': planned_entry,
-                                'entry_actual': execution_entry_price,
-                                'sl_planned': planned_stop_loss,
-                                'sl_actual': execution_stop_loss,
-                                'tp_planned': planned_take_profit,
-                                'tp_actual': execution_take_profit,
-                                'rr_ratio': finalized.rr_ratio,
-                                'symbol': SYMBOL,
-                                'timeframe': TIMEFRAME,
-                                'execution_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                'lot': lot_size,
-                                'scalping_grade': scalping_grade,
-                                'scalping_mode': True,
-                                'session': current_session,
-                                'price_deviation_pips': price_deviation_pips,
-                                'order_type': order_type  # اضافه کردن نوع سفارش
-                            }
-                            
-                            report_result = report_gen.generate_full_report(
-                                df=df,
-                                signal_data=signal_data,
-                                order_details=order_details
-                            )
-                            
-                            if report_result['success']:
-                                logger.info(f"📊 گزارش کامل معامله اسکلپینگ Real-Time ذخیره شد")
-                                print(f"📊 گزارش کامل معامله اسکلپینگ تولید شد")
-                    except ImportError:
-                        logger.debug("ماژول گزارش‌گیری یافت نشد، فقط JSON ذخیره شد.")
-                    
-                except Exception as e:
-                    logger.error(f"⚠️ خطا در فرآیند گزارش‌گیری اسکلپینگ: {e}")
-                    print(f"⚠️ خطا در گزارش‌گیری: {e}")
+                generate_execution_report(
+                    logger=logger,
+                    signal_data=signal_data,
+                    finalized=finalized,
+                    order_id=order_id,
+                    symbol=SYMBOL,
+                    timeframe=TIMEFRAME,
+                    order_type=order_type,
+                    lot_size=lot_size,
+                    current_session=current_session,
+                    scalping_grade=scalping_grade,
+                    market_metrics=market_metrics,
+                    current_price_data=current_price_data,
+                    price_deviation_pips=price_deviation_pips,
+                    risk_manager=self.risk_manager,
+                    df=df
+                )
 
 
                 try:
@@ -1100,36 +792,6 @@ class NDSBot:
             print(f"❌ خطا در اجرای معامله اسکلپینگ Real-Time: {e}")
             self.bot_state.add_trade(success=False)
             return False
-
-    def _log_price_deviation_rejection(self, symbol: str, planned_price: float, 
-                                      market_price: float, deviation_pips: float, 
-                                      max_allowed_pips: float):
-        """🔥 ثبت رد معامله به دلیل انحراف قیمت در فایل لاگ"""
-        try:
-            rejection_log = {
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'symbol': symbol,
-                'planned_price': planned_price,
-                'market_price': market_price,
-                'deviation_pips': deviation_pips,
-                'max_allowed_pips': max_allowed_pips,
-                'reason': 'price_deviation_exceeded',
-                'action': 'trade_rejected'
-            }
-            
-            # ذخیره در فایل JSON
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            file_path = f"trade_reports/rejections/price_deviation_{symbol}_{timestamp}.json"
-            Path("trade_reports/rejections").mkdir(parents=True, exist_ok=True)
-            
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(rejection_log, f, indent=2, ensure_ascii=False)
-                
-            logger.info(f"📝 رد معامله به دلیل انحراف قیمت در {file_path} ذخیره شد")
-            
-        except Exception as e:
-            logger.error(f"خطا در ثبت رد معامله: {e}")
-
 
     def _monitor_open_trades(self):
         """🔥 مانیتورینگ هوشمند، بروزرسانی وضعیت معاملات و ارسال نتیجه نهایی به تلگرام"""
@@ -1202,217 +864,6 @@ class NDSBot:
     def execute_trade(self, signal_data: dict, df=None) -> bool:
         """متد اصلی برای سازگاری با کدهای قدیمی - از execute_scalping_trade استفاده می‌کند"""
         return self.execute_scalping_trade(signal_data, df)
-
-    def get_user_action(self, timeout: float = 0.1) -> str:
-        """دریافت عمل کاربر (پشتیبانی کامل از ویندوز و تردینگ)"""
-        try:
-            if os.name == 'nt':  # ویندوز
-                import msvcrt
-                
-                # استفاده از threading برای جلوگیری از مسدود شدن برنامه
-                key_pressed = [None]
-                
-                def check_key():
-                    if msvcrt.kbhit():
-                        key = msvcrt.getch()
-                        if key:
-                            key_pressed[0] = key.decode('utf-8', errors='ignore').lower()
-                
-                key_thread = threading.Thread(target=check_key)
-                key_thread.daemon = True
-                key_thread.start()
-                key_thread.join(timeout=timeout)
-                
-                key = key_pressed[0]
-            else:  # لینوکس/مک
-                import select
-                if select.select([sys.stdin], [], [], timeout)[0]:
-                    key = sys.stdin.read(1).lower()
-                else:
-                    key = None
-            
-            if key:
-                logger.debug(f"User action detected: {key}")
-                key_map = {
-                    'q': 'quit', 'p': 'pause', 's': 'status', 'c': 'config',
-                    't': 'toggle_trading', 'r': 'toggle_risk', 'd': 'toggle_dry_run',
-                    'k': 'skip', 'h': 'help'
-                }
-                return key_map.get(key, '')
-        except Exception as e:
-            logger.debug(f"خطا در دریافت ورودی کاربر: {e}")
-        
-        return ''
-
-    def handle_user_action(self, action: str):
-        """مدیریت دستورات کاربر"""
-        logger.info(f"User action: {action}")
-        
-        action_handlers = {
-            'quit': lambda: setattr(self.bot_state, 'running', False) or logger.info("👋 درخواست خروج") or print("\n👋 درخواست خروج"),
-            'pause': lambda: (
-                setattr(self.bot_state, 'paused', not self.bot_state.paused),
-                logger.info(f"⏸️  ربات {'متوقف شد' if self.bot_state.paused else 'ادامه یافت'}"),
-                print(f"\n⏸️  ربات {'متوقف شد' if self.bot_state.paused else 'ادامه یافت'}")
-            ),
-            'status': lambda: (logger.info("📊 نمایش وضعیت ربات"), self.print_status()),
-            'config': lambda: (logger.info("⚙️  به‌روزرسانی تنظیمات"), update_config_interactive()),
-            'toggle_trading': lambda: (
-                self.config.update_setting('trading_settings.ENABLE_AUTO_TRADING', not self.config.get('trading_settings.ENABLE_AUTO_TRADING')),
-                logger.info(f"🤖 معاملات خودکار {'فعال' if not self.config.get('trading_settings.ENABLE_AUTO_TRADING') else 'غیرفعال'} شد"),
-                print(f"\n🤖 معاملات خودکار {'فعال' if not self.config.get('trading_settings.ENABLE_AUTO_TRADING') else 'غیرفعال'} شد")
-            ),
-            'toggle_risk': lambda: (
-                self.config.update_setting('trading_settings.ENABLE_RISK_MANAGER', not self.config.get('trading_settings.ENABLE_RISK_MANAGER')),
-                logger.info(f"🛡️  مدیر ریسک {'فعال' if not self.config.get('trading_settings.ENABLE_RISK_MANAGER') else 'غیرفعال'} شد"),
-                print(f"\n🛡️  مدیر ریسک {'فعال' if not self.config.get('trading_settings.ENABLE_RISK_MANAGER') else 'غیرفعال'} شد")
-            ),
-            'toggle_dry_run': lambda: (
-                self.config.update_setting('trading_settings.ENABLE_DRY_RUN', not self.config.get('trading_settings.ENABLE_DRY_RUN')),
-                logger.info(f"🔧 حالت آزمایشی {'فعال' if not self.config.get('trading_settings.ENABLE_DRY_RUN') else 'غیرفعال'} شد"),
-                print(f"\n🔧 حالت آزمایشی {'فعال' if not self.config.get('trading_settings.ENABLE_DRY_RUN') else 'غیرفعال'} شد")
-            ),
-            'skip': lambda: (logger.info("⏩ رد کردن زمان انتظار"), print("\n⏩ رد کردن زمان انتظار")),
-            'help': lambda: (logger.info("📖 نمایش راهنما"), print_help())
-        }
-        
-        handler = action_handlers.get(action)
-        if handler:
-            handler()
-
-    def wait_with_controls(self, seconds):
-            """انتظار هوشمند همراه با مانیتورینگ مداوم پوزیشن‌ها"""
-            next_time = datetime.now() + timedelta(seconds=seconds)
-            next_time_str = next_time.strftime('%H:%M:%S')
-            
-            msg = f"⏳ انتظار برای سیکل بعدی... تحلیل شماره بعدی در ساعت {next_time_str} انجام خواهد شد."
-            logger.info(msg)
-            print(f"\n{msg}")
-            print("   (P=توقف، S=وضعیت، C=تنظیمات، Q=خروج)")
-
-            start_wait = time.time()
-            
-            # ✅ FIX 1: تعریف متغیر قبل از ورود به حلقه
-            last_monitor_time = time.time() 
-
-            while time.time() - start_wait < seconds:
-                if not self.bot_state.running or self.bot_state.paused:
-                    break
-                    
-                # ✅ FIX 2: اجرای مانیتورینگ هر 3 ثانیه یکبار
-                if time.time() - last_monitor_time > 3.0:
-                    self._monitor_open_trades() # فراخوانی متد جدید
-                    last_monitor_time = time.time() # ریست کردن تایمر
-
-                # بررسی ورودی کیبورد
-                action = self.get_user_action()
-                if action:
-                    self.handle_user_action(action)
-                    if action == 'status':
-                        print(f"\n{msg}")
-
-                time.sleep(0.5)
-
-    def print_status(self):
-            """نمایش وضعیت لحظه‌ای ربات"""
-            stats = self.bot_state.get_statistics()
-            
-            # دسترسی ایمن به تنظیمات از فایل JSON
-            trading_cfg = self.config.get('trading_settings')
-            tech_cfg = self.config.get('technical_settings')
-            
-            SYMBOL = trading_cfg['SYMBOL']
-            TIMEFRAME = trading_cfg['TIMEFRAME']
-            MIN_CONF = tech_cfg['SCALPING_MIN_CONFIDENCE']
-
-            logger.info(f"📊 وضعیت ربات: {SYMBOL} | {TIMEFRAME} | Conf: {MIN_CONF}%")
-            
-            print(f"\n" + "="*45)
-            print(f"📊 وضعیت ربات: {SYMBOL} ({TIMEFRAME})")
-            print(f"   حداقل اعتماد تنظیمی: {MIN_CONF}%")
-            
-            # اصلاح خطا: تبدیل خروجی محاسبات به int برای سازگاری با فرمت :02d
-            hours = int(stats['runtime_seconds'] // 3600)
-            minutes = int((stats['runtime_seconds'] % 3600) // 60)
-            print(f"   زمان اجرا: {hours}:{minutes:02d}")
-            
-            print(f"   تحلیل‌ها: {stats['analysis_count']} | معاملات: {stats['trade_count']}")
-            
-            if stats['trade_count'] > 0:
-                print(f"   نرخ موفقیت: {stats['success_rate']:.1f}%")
-            
-            print(f"   سود کل: ${stats['total_profit']:.2f} | روزانه: ${stats['daily_pnl']:.2f}")
-            
-            # نمایش پوزیشن‌های باز
-            open_positions = self.get_open_positions_count()
-            print(f"   پوزیشن‌های باز: {open_positions}")
-            
-            if open_positions > 0:
-                positions_info = self.get_open_positions_info()
-                for pos in positions_info[:3]:
-                    # --- اصلاح برای رفع اخطار بدون تغییر در ساختار ---
-                    ticket = pos.get('ticket')
-                    p_type = pos.get('type')
-                    volume = pos.get('volume', 0.0) or 0.0
-                    profit = pos.get('profit', 0.0) or 0.0
-                    
-                    profit_color = "🟢" if profit >= 0 else "🔴"
-                    
-                    print(f"   └─ #{ticket}: {p_type} {volume}L -> {profit_color}${profit:.2f}")
-
-            # بخش مدیریت ریسک اسکلپینگ
-            if self.risk_manager and hasattr(self.risk_manager, 'get_scalping_summary'):
-                try:
-                    scalping_summary = self.risk_manager.get_scalping_summary()
-                    print(f"   سشن: {scalping_summary.get('current_session', 'N/A')} "
-                        f"({'✅' if scalping_summary.get('session_friendly') else '❌'})")
-                except Exception as e:
-                    pass
-            
-            # ============ سیستم ردیابی معاملات ============
-            # نمایش آمار سیستم ردیابی (اگر تعریف شده باشد)
-            if hasattr(self, 'trade_tracker'):
-                try:
-                    daily_stats = self.trade_tracker.get_daily_stats()
-                    
-                    # فقط اگر معامله‌ای ثبت شده باشد نمایش بده
-                    if daily_stats.get('total_trades', 0) > 0 or daily_stats.get('active_trades', 0) > 0:
-                        print(f"   📊 آمار سیستم ردیابی:")
-                        print(f"      • معاملات امروز: {daily_stats.get('total_trades', 0)}")
-                        
-                        if daily_stats.get('total_trades', 0) > 0:
-                            win_rate = daily_stats.get('win_rate', 0.0) or 0.0
-                            total_p = daily_stats.get('total_profit', 0.0) or 0.0
-                            max_p = daily_stats.get('max_daily_profit', 0.0) or 0.0
-                            
-                            print(f"      • وین ریت: {win_rate:.1f}%")
-                            print(f"      • سود امروز: ${total_p:.2f}")
-                            print(f"      • حداکثر سود: ${max_p:.2f}")
-                        
-                        if daily_stats.get('active_trades', 0) > 0:
-                            print(f"      • معاملات فعال: {daily_stats.get('active_trades', 0)}")
-                            # نمایش 2 معامله فعال اول
-                            active_trades = list(self.trade_tracker.active_trades.items())[:2]
-                            for ticket, trade in active_trades:
-                                # ایمن‌سازی مقادیر برای جلوگیری از خطای NoneType
-                                raw_profit = trade.get('current_profit', 0.0)
-                                if raw_profit is None: raw_profit = 0.0
-                                
-                                profit_color = "🟢" if raw_profit >= 0 else "🔴"
-                                signal_type = trade.get('signal_type') or trade.get('type', 'UNKNOWN')
-                                signal_emoji = "📈" if "BUY" in str(signal_type).upper() else "📉"
-                                
-                                # فرمت‌بندی ایمن
-                                print(f"         {signal_emoji} #{ticket}: {profit_color}${raw_profit:.2f}")
-                        
-                        if daily_stats.get('closed_trades', 0) > 0:
-                            print(f"      • معاملات بسته: {daily_stats.get('closed_trades', 0)}")
-                except Exception as e:
-                    # لاگ کردن خطا برای دیباگ
-                    logger.warning(f"⚠️ جزئیات خطا در نمایش آمار: {e}")
-            # ============ پایان سیستم ردیابی ============
-            
-            print("="*45)
 
     def cleanup(self):
         """تمیزکاری منابع و قطع اتصال"""
@@ -1532,7 +983,7 @@ class NDSBot:
         print(f"\n⏳ تحلیل بعدی در {ANALYSIS_INTERVAL_MINUTES} دقیقه...")
         print("   (فشار دهید: P=توقف, S=وضعیت, Q=خروج)")
         
-        self.wait_with_controls(wait_time)
+        self.user_controls.wait_with_controls(wait_time)
 
     def _handle_pause_mode(self):
         """مدیریت حالت توقف ربات"""
@@ -1541,7 +992,7 @@ class NDSBot:
             print("\n⏸️  ربات متوقف شده")
             print("   P=ادامه, Q=خروج, C=تنظیمات")
             
-            action = self.get_user_action()
+            action = self.user_controls.get_user_action()
             
             if action == 'pause':
                 self._resume_robot()
