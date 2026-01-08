@@ -31,7 +31,7 @@ def build_analysis(signal: str, entry: float, sl: float, tp: float, confidence: 
         stop_loss=sl,
         take_profit=tp,
         reasons=["smoke-test"],
-        context={"market_metrics": {"atr": 1.0, "volatility_ratio": 1.0}},
+        context={"market_metrics": {"atr": 3.0, "volatility_ratio": 1.0}},
         timestamp="2024-01-01T00:00:00Z",
         timeframe="M5",
         current_price=entry
@@ -64,8 +64,8 @@ def main():
     point_size = base_config["trading_settings"]["GOLD_SPECIFICATIONS"]["POINT"]
 
     entry = 2400.0
-    sl = 2390.0
-    tp = 2420.0
+    sl = 2394.0
+    tp = 2406.0
 
     analysis_buy = build_analysis("BUY", entry, sl, tp, confidence=limit_conf + 1)
     small_dev_live = LivePriceSnapshot(

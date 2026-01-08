@@ -92,8 +92,61 @@ class ScalpingRiskManager:
         # جهت سازگاری با کدهای قدیمی که ممکن است از self.config استفاده کنند
         self.config = self.settings 
 
-        trading_settings = full_config.get('trading_settings', {})
-        self.GOLD_SPECS = trading_settings.get('GOLD_SPECIFICATIONS', {})
+        trading_settings = self.settings.get('trading_settings', {}) or {}
+        self.GOLD_SPECS = trading_settings.get('GOLD_SPECIFICATIONS', {}) or {}
+
+
+        # --- Normalize GOLD spec keys (backward compatible) ---
+        specs = dict(self.GOLD_SPECS)  # copy
+
+        # canonical keys expected in code
+        if 'tick_value_per_lot' not in specs:
+            # your config uses TICK_VALUE_PER_LOT
+            if 'TICK_VALUE_PER_LOT' in specs:
+                specs['tick_value_per_lot'] = specs['TICK_VALUE_PER_LOT']
+
+        if 'point' not in specs:
+            if 'POINT' in specs:
+                specs['point'] = specs['POINT']
+
+        if 'min_lot' not in specs:
+            if 'MIN_LOT' in specs:
+                specs['min_lot'] = specs['MIN_LOT']
+
+        if 'max_lot' not in specs:
+            if 'MAX_LOT' in specs:
+                specs['max_lot'] = specs['MAX_LOT']
+
+        if 'lot_step' not in specs:
+            if 'LOT_STEP' in specs:
+                specs['lot_step'] = specs['LOT_STEP']
+
+        if 'contract_size' not in specs:
+            if 'CONTRACT_SIZE' in specs:
+                specs['contract_size'] = specs['CONTRACT_SIZE']
+
+        if 'digits' not in specs:
+            if 'DIGITS' in specs:
+                specs['digits'] = specs['DIGITS']
+
+        # fail fast with explicit message (better than KeyError in the middle of a trade)
+        required = ['tick_value_per_lot', 'point', 'min_lot', 'max_lot', 'lot_step']
+        missing = [k for k in required if k not in specs]
+        if missing:
+            raise KeyError(f"GOLD_SPECIFICATIONS missing required keys: {missing}. موجود: {list(specs.keys())}")
+
+        self.GOLD_SPECS = specs
+
+
+
+
+
+
+
+
+
+
+
 
         # ۵. وضعیت ردیابی ریسک اسکلپینگ (بدون تغییر)
         self.daily_risk_used = 0.0
