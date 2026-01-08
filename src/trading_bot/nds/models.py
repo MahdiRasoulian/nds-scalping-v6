@@ -187,3 +187,25 @@ class AnalysisResult:
     timestamp: str
     timeframe: str
     current_price: float
+
+@dataclass
+class LivePriceSnapshot:
+    bid: float
+    ask: float
+    timestamp: Optional[str] = None
+
+@dataclass
+class FinalizedOrderParams:
+    signal: str
+    order_type: str
+    symbol: str
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    lot_size: float
+    risk_amount_usd: float
+    rr_ratio: float
+    deviation_pips: float
+    decision_notes: List[str]
+    is_trade_allowed: bool
+    reject_reason: Optional[str] = None

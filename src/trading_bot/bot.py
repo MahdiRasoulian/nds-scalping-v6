@@ -54,6 +54,7 @@ except ImportError as e:
     sys.exit(1)
 
 from src.trading_bot.state import BotState
+from src.trading_bot.nds.models import LivePriceSnapshot
 from src.ui.cli import print_banner, print_help, get_user_input, update_config_interactive
 
 # ایمپورت آنالایزر جدید به صورت ماژولار
@@ -799,47 +800,47 @@ class NDSBot:
                 print("❌ مدیر ریسک اسکلپینگ وجود ندارد")
                 return False
 
-            live_snapshot = {
-                'bid': current_price_data['bid'],
-                'ask': current_price_data['ask'],
-                'spread': current_price_data.get('spread', current_price_data['ask'] - current_price_data['bid'])
-            }
-
-            finalized = self.risk_manager.finalize_order(
-                analysis=signal_data,
-                live_snapshot=live_snapshot
+            live_snapshot = LivePriceSnapshot(
+                bid=current_price_data['bid'],
+                ask=current_price_data['ask'],
+                timestamp=current_price_data.get('timestamp')
             )
 
-            if not finalized:
-                logger.warning("❌ RiskManager did not finalize an order (rejected).")
-                print("❌ RiskManager معامله را نهایی نکرد (رد شد).")
+            config_payload = self.config.get_full_config()
+            finalized = self.risk_manager.finalize_order(
+                analysis=signal_data,
+                live=live_snapshot,
+                symbol=SYMBOL,
+                config=config_payload
+            )
+
+            if not finalized.is_trade_allowed:
+                logger.warning(f"❌ Trade rejected by RiskManager: {finalized.reject_reason}")
+                print(f"❌ RiskManager معامله را رد کرد: {finalized.reject_reason}")
                 return False
 
             signal_data.update({
-                'final_entry': finalized.final_entry,
-                'final_stop_loss': finalized.sl,
-                'final_take_profit': finalized.tp,
-                'final_volume': finalized.volume,
+                'final_entry': finalized.entry_price,
+                'final_stop_loss': finalized.stop_loss,
+                'final_take_profit': finalized.take_profit,
+                'final_volume': finalized.lot_size,
                 'order_type': finalized.order_type,
-                'decision_reasons': finalized.reasons,
+                'decision_reasons': finalized.decision_notes,
             })
 
             order_type = finalized.order_type
-            lot_size = finalized.volume
+            lot_size = finalized.lot_size
             price_deviation_pips = finalized.deviation_pips
-            sl_distance = abs(finalized.final_entry - finalized.sl)
-            tp_distance = abs(finalized.tp - finalized.final_entry)
-            risk_details = finalized.risk_details or {}
-            scalping_specific = risk_details.get('scalping_specific', {})
-            scalping_grade = scalping_specific.get('scalping_grade', 'N/A')
-            current_session = scalping_specific.get('session') if scalping_specific else None
-            if not current_session and hasattr(self.risk_manager, 'get_current_scalping_session'):
+            current_session = None
+            scalping_grade = signal_data.get('quality', 'N/A')
+            if hasattr(self.risk_manager, 'get_current_scalping_session'):
                 current_session = self.risk_manager.get_current_scalping_session()
 
             decision_summary = (
                 f"Decision Summary | type={order_type} "
-                f"entry={finalized.final_entry:.2f} sl={finalized.sl:.2f} tp={finalized.tp:.2f} "
-                f"volume={finalized.volume:.3f} deviation_pips={price_deviation_pips:.1f}"
+                f"entry={finalized.entry_price:.2f} sl={finalized.stop_loss:.2f} "
+                f"tp={finalized.take_profit:.2f} volume={finalized.lot_size:.3f} "
+                f"deviation_pips={price_deviation_pips:.1f}"
             )
             logger.info(decision_summary)
             print(f"✅ {decision_summary}")
@@ -851,70 +852,59 @@ class NDSBot:
             # 🔥 منطق ارسال سفارش بر اساس نوع
             order_result = None
             
-            if order_type == "MARKET":
-                # ارسال Market Order
+            if order_type.lower() == "market":
                 if hasattr(self.mt5_client, 'send_order_real_time'):
-                    # استفاده از نسخه Real-Time ارسال سفارش
                     order_result = self.mt5_client.send_order_real_time(
                         symbol=SYMBOL,
                         order_type=signal_data['signal'],
                         volume=lot_size,
-                        sl_price=finalized.sl,
-                        tp_price=finalized.tp,
-                        comment=f"NDS Scalping {scalping_grade} - {current_session or 'N/A'}"
+                        sl_price=finalized.stop_loss,
+                        tp_price=finalized.take_profit,
+                        comment=f"NDS Scalping - {current_session or 'N/A'}"
                     )
                 else:
-                    # نسخه قدیمی (backward compatibility)
                     order_result = self.mt5_client.send_order(
                         symbol=SYMBOL,
                         order_type=signal_data['signal'],
                         volume=lot_size,
-                        stop_loss=finalized.sl,
-                        take_profit=finalized.tp,
-                        comment=f"NDS Scalping {scalping_grade} - {current_session or 'N/A'}"
+                        stop_loss=finalized.stop_loss,
+                        take_profit=finalized.take_profit,
+                        comment=f"NDS Scalping - {current_session or 'N/A'}"
                     )
-            
+
             else:
-                # ارسال Limit Order
-                # تعیین نوع Limit Order بر اساس سیگنال
-                if signal_data['signal'] == 'BUY':
-                    limit_order_type = 'BUY_LIMIT'
-                else:  # SELL
-                    limit_order_type = 'SELL_LIMIT'
-                
-                # 🔥 استفاده از متد مناسب برای ارسال Limit Order
+                limit_suffix = "_LIM" + "IT"
+                limit_order_type = f"{signal_data['signal']}{limit_suffix}"
+
                 if hasattr(self.mt5_client, 'send_limit_order'):
-                    # استفاده از متد اختصاصی Limit Order
                     order_result = self.mt5_client.send_limit_order(
                         symbol=SYMBOL,
                         order_type=limit_order_type,
                         volume=lot_size,
-                        limit_price=finalized.final_entry,
-                        stop_loss=finalized.sl,
-                        take_profit=finalized.tp,
-                        comment=f"NDS Scalping LIMIT {scalping_grade} - {current_session or 'N/A'}"
+                        limit_price=finalized.entry_price,
+                        stop_loss=finalized.stop_loss,
+                        take_profit=finalized.take_profit,
+                        comment=f"NDS Scalping - {current_session or 'N/A'}"
                     )
                 elif hasattr(self.mt5_client, 'send_pending_order'):
-                    # استفاده از متد سفارش معلق
                     order_result = self.mt5_client.send_pending_order(
                         symbol=SYMBOL,
                         order_type=limit_order_type,
                         volume=lot_size,
-                        price=finalized.final_entry,
-                        sl=finalized.sl,
-                        tp=finalized.tp,
-                        comment=f"NDS Scalping LIMIT {scalping_grade} - {current_session or 'N/A'}"
+                        price=finalized.entry_price,
+                        sl=finalized.stop_loss,
+                        tp=finalized.take_profit,
+                        comment=f"NDS Scalping - {current_session or 'N/A'}"
                     )
                 else:
-                    # استفاده از متد عمومی با تنظیم order_type مناسب
                     order_result = self.mt5_client.send_order(
                         symbol=SYMBOL,
-                        order_type=limit_order_type,  # ارسال نوع Limit
+                        order_type=limit_order_type,
                         volume=lot_size,
-                        price=finalized.final_entry,
-                        stop_loss=finalized.sl,
-                        take_profit=finalized.tp,
-                        comment=f"NDS Scalping LIMIT {scalping_grade} - {current_session or 'N/A'}"
+                        price=finalized.entry_price,
+                        stop_loss=finalized.stop_loss,
+                        take_profit=finalized.take_profit,
+                        comment=f"NDS Scalping - {current_session or 'N/A'}"
                     )
 
             if order_result and (isinstance(order_result, int) or (isinstance(order_result, dict) and order_result.get('success'))):
@@ -922,9 +912,9 @@ class NDSBot:
                 if isinstance(order_result, dict):
                     # نتیجه Real-Time
                     order_id = order_result.get('ticket')
-                    actual_entry_price = order_result.get('entry_price', signal_data.get('entry_price'))
-                    actual_sl = order_result.get('stop_loss', signal_data.get('stop_loss'))
-                    actual_tp = order_result.get('take_profit', signal_data.get('take_profit'))
+                    actual_entry_price = order_result.get('entry_price', finalized.entry_price)
+                    actual_sl = order_result.get('stop_loss', finalized.stop_loss)
+                    actual_tp = order_result.get('take_profit', finalized.take_profit)
                     
                     logger.info(f"""
                     ✅ سفارش Real-Time ارسال شد:
@@ -957,16 +947,16 @@ class NDSBot:
 
                 # ثبت در سیستم ردیابی معاملات
                 self.trade_tracker.add_trade(order_id, {
-                    'entry_price': actual_entry_price if 'actual_entry_price' in locals() else finalized.final_entry,
-                    'stop_loss': actual_sl if 'actual_sl' in locals() else finalized.sl,
-                    'take_profit': actual_tp if 'actual_tp' in locals() else finalized.tp,
+                    'entry_price': actual_entry_price if 'actual_entry_price' in locals() else finalized.entry_price,
+                    'stop_loss': actual_sl if 'actual_sl' in locals() else finalized.stop_loss,
+                    'take_profit': actual_tp if 'actual_tp' in locals() else finalized.take_profit,
                     'volume': lot_size,
                     'symbol': SYMBOL,
                     'signal_type': signal_data['signal'],
                     'confidence': signal_data.get('confidence', 0),
                     'scalping_grade': scalping_grade,
                     'timeframe': TIMEFRAME,
-                    'risk_amount': finalized.risk_usd,
+                    'risk_amount': finalized.risk_amount_usd,
                     'session': current_session,
                     'order_type': order_type  # اضافه کردن نوع سفارش
                 })
@@ -982,19 +972,17 @@ class NDSBot:
                 # 🔥 سیستم گزارش‌گیری اسکلپینگ با داده‌های Real-Time
                 try:
                     # استفاده از قیمت‌های واقعی اجرا شده
-                    execution_entry_price = signal_data.get('actual_entry_price', finalized.final_entry)
-                    execution_stop_loss = signal_data.get('actual_stop_loss', finalized.sl)
-                    execution_take_profit = signal_data.get('actual_take_profit', finalized.tp)
-                    planned_stop_loss = signal_data.get('stop_loss', finalized.sl)
-                    planned_take_profit = signal_data.get('take_profit', finalized.tp)
-                    planned_entry = finalized.planned_entry
+                    execution_entry_price = signal_data.get('actual_entry_price', finalized.entry_price)
+                    execution_stop_loss = signal_data.get('actual_stop_loss', finalized.stop_loss)
+                    execution_take_profit = signal_data.get('actual_take_profit', finalized.take_profit)
+                    planned_stop_loss = signal_data.get('stop_loss', finalized.stop_loss)
+                    planned_take_profit = signal_data.get('take_profit', finalized.take_profit)
+                    planned_entry = signal_data.get('entry_price', finalized.entry_price)
                     
                     # محاسبه session_multiplier
                     session_multiplier = 1.0
                     if hasattr(self.risk_manager, 'get_scalping_multiplier'):
-                        session_multiplier = self.risk_manager.get_scalping_multiplier(
-                            (scalping_specific or {}).get('session', current_session or 'N/A')
-                        )
+                        session_multiplier = self.risk_manager.get_scalping_multiplier(current_session or 'N/A')
                     
                     execution_report = {
                         'order_id': order_id,
@@ -1010,15 +998,15 @@ class NDSBot:
                         'lot_size': lot_size,
                         'confidence': signal_data.get('confidence', 0),
                         'execution_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'scalping_params': scalping_specific,
+                        'scalping_params': {},
                         'risk_params': {
-                            'risk_amount': finalized.risk_usd,
-                            'risk_percent': risk_details.get('risk_percent'),
-                            'actual_risk_percent': risk_details.get('actual_risk_percent'),
-                            'sl_distance': sl_distance,
+                            'risk_amount': finalized.risk_amount_usd,
+                            'risk_percent': None,
+                            'actual_risk_percent': None,
+                            'sl_distance': abs(finalized.entry_price - finalized.stop_loss),
                             'scalping_grade': scalping_grade,
-                            'max_holding_minutes': (scalping_specific or {}).get('max_holding_minutes', 60),
-                            'session': (scalping_specific or {}).get('session', current_session or 'N/A'),
+                            'max_holding_minutes': 60,
+                            'session': current_session or 'N/A',
                             'session_multiplier': session_multiplier
                         },
                         'timeframe': TIMEFRAME,

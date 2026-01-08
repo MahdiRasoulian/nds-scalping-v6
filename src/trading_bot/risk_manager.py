@@ -7,7 +7,7 @@
 import logging
 import numpy as np
 from typing import Dict, Optional, Any, Tuple, List, TYPE_CHECKING, Union
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime, time, timedelta, timezone
 import math
 
@@ -16,24 +16,9 @@ from config.settings import config
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from src.trading_bot.nds.models import AnalysisResult
+    from src.trading_bot.nds.models import AnalysisResult, FinalizedOrderParams, LivePriceSnapshot
 
-@dataclass
-class FinalizedOrderParams:
-    symbol: str
-    signal: str
-    order_type: str
-    volume: float
-    planned_entry: float
-    final_entry: float
-    sl: float
-    tp: float
-    risk_usd: float
-    rr_ratio: float
-    deviation_pips: float
-    deviation_ok: bool
-    reasons: List[str] = field(default_factory=list)
-    risk_details: Dict[str, Any] = field(default_factory=dict)
+from src.trading_bot.nds.models import FinalizedOrderParams, LivePriceSnapshot
 
 @dataclass
 class ScalpingRiskParameters:
@@ -458,100 +443,241 @@ class ScalpingRiskManager:
     def finalize_order(
         self,
         analysis: Union['AnalysisResult', Dict[str, Any]],
-        live_snapshot: Dict[str, float]
-    ) -> Optional[FinalizedOrderParams]:
+        live: Union[LivePriceSnapshot, Dict[str, Any]],
+        symbol: str,
+        config: Dict[str, Any]
+    ) -> FinalizedOrderParams:
         """
         Finalize an order decision using live market snapshot and unified risk settings.
         """
         analysis_payload = self._normalize_analysis_payload(analysis)
+        live_payload = live if isinstance(live, dict) else asdict(live)
+
+        decision_notes: List[str] = []
+        analysis_reasons = analysis_payload.get('reasons') or []
+        decision_notes.extend(list(analysis_reasons))
         signal = analysis_payload.get('signal')
         if not signal or signal in ['NONE', 'NEUTRAL']:
-            return None
+            return FinalizedOrderParams(
+                signal=signal or 'NONE',
+                order_type='NONE',
+                symbol=symbol,
+                entry_price=0.0,
+                stop_loss=0.0,
+                take_profit=0.0,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=0.0,
+                deviation_pips=0.0,
+                decision_notes=["No actionable signal from analyzer."],
+                is_trade_allowed=False,
+                reject_reason="Signal is NONE/NEUTRAL."
+            )
 
-        if not live_snapshot:
-            self._logger.warning("❌ Live snapshot missing, cannot finalize order.")
-            return None
-
-        bid = live_snapshot.get('bid')
-        ask = live_snapshot.get('ask')
-        spread = live_snapshot.get('spread')
-        if bid is None or ask is None:
-            self._logger.warning("❌ Live snapshot missing bid/ask, cannot finalize order.")
-            return None
-
-        symbol = analysis_payload.get('symbol') or config.get('trading_settings.SYMBOL')
         planned_entry = analysis_payload.get('entry_price')
         stop_loss = analysis_payload.get('stop_loss')
         take_profit = analysis_payload.get('take_profit')
-        confidence = analysis_payload.get('confidence', 0)
-        reasons = list(analysis_payload.get('reasons', []))
+        confidence = analysis_payload.get('confidence')
+        if planned_entry is None or stop_loss is None or take_profit is None:
+            return FinalizedOrderParams(
+                signal=signal,
+                order_type='NONE',
+                symbol=symbol,
+                entry_price=planned_entry or 0.0,
+                stop_loss=stop_loss or 0.0,
+                take_profit=take_profit or 0.0,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=0.0,
+                deviation_pips=0.0,
+                decision_notes=["Missing entry/SL/TP from analyzer."],
+                is_trade_allowed=False,
+                reject_reason="Analyzer did not provide entry/SL/TP."
+            )
 
-        if stop_loss is None or take_profit is None:
-            self._logger.warning("❌ Missing SL/TP in analysis result, cannot finalize order.")
-            return None
+        if confidence is None:
+            confidence = 0.0
+
+        bid = live_payload.get('bid')
+        ask = live_payload.get('ask')
+        if bid is None or ask is None:
+            return FinalizedOrderParams(
+                signal=signal,
+                order_type='NONE',
+                symbol=symbol,
+                entry_price=planned_entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=0.0,
+                deviation_pips=0.0,
+                decision_notes=["Live snapshot missing bid/ask."],
+                is_trade_allowed=False,
+                reject_reason="Live prices unavailable."
+            )
+
+        risk_settings = config.get('risk_settings', {})
+        trading_settings = config.get('trading_settings', {})
+        risk_manager_config = config.get('risk_manager_config', {})
+
+        max_deviation_pips = risk_settings.get('MAX_PRICE_DEVIATION_PIPS')
+        limit_min_confidence = risk_settings.get('LIMIT_ORDER_MIN_CONFIDENCE')
+        max_entry_atr_deviation = risk_settings.get('MAX_ENTRY_ATR_DEVIATION')
+        min_rr_ratio = risk_manager_config.get('MIN_RR_RATIO')
+
+        if max_deviation_pips is None or limit_min_confidence is None or min_rr_ratio is None:
+            return FinalizedOrderParams(
+                signal=signal,
+                order_type='NONE',
+                symbol=symbol,
+                entry_price=planned_entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=0.0,
+                deviation_pips=0.0,
+                decision_notes=["Missing risk settings in config."],
+                is_trade_allowed=False,
+                reject_reason="Risk settings missing from config."
+            )
 
         market_entry = ask if signal == 'BUY' else bid
-        if planned_entry is None:
-            planned_entry = market_entry
-            reasons.append("No planned entry from analysis; using market snapshot.")
-
         deviation = abs(planned_entry - market_entry)
-        deviation_pips = deviation * 10
-        max_deviation_pips = self.settings.get('MAX_PRICE_DEVIATION_PIPS', 0.0)
-        limit_min_confidence = self.settings.get('LIMIT_ORDER_MIN_CONFIDENCE', 74.0)
+        gold_specs = trading_settings.get('GOLD_SPECIFICATIONS', {})
+        point_size = gold_specs.get('POINT')
+        deviation_pips = deviation / point_size if point_size else deviation
 
-        order_type = "MARKET"
-        final_entry = market_entry
-        deviation_ok = True
+        order_type = 'MARKET'
+        entry_price = market_entry
 
         if deviation_pips > max_deviation_pips:
             if confidence >= limit_min_confidence:
-                order_type = "LIMIT"
-                final_entry = planned_entry
-                reasons.append(
+                order_type = 'LIMIT'
+                entry_price = planned_entry
+                decision_notes.append(
                     f"Deviation {deviation_pips:.1f} pips > max {max_deviation_pips:.1f}: using LIMIT."
                 )
             else:
-                reasons.append(
+                decision_notes.append(
                     f"Deviation {deviation_pips:.1f} pips > max {max_deviation_pips:.1f} with low confidence."
                 )
-                self._logger.warning("❌ Price deviation exceeded without confidence; order rejected.")
-                return None
+                return FinalizedOrderParams(
+                    signal=signal,
+                    order_type='NONE',
+                    symbol=symbol,
+                    entry_price=planned_entry,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    lot_size=0.0,
+                    risk_amount_usd=0.0,
+                    rr_ratio=0.0,
+                    deviation_pips=deviation_pips,
+                    decision_notes=decision_notes,
+                    is_trade_allowed=False,
+                    reject_reason="Deviation exceeded without sufficient confidence."
+                )
         else:
-            reasons.append(
+            decision_notes.append(
                 f"Deviation {deviation_pips:.1f} pips <= max {max_deviation_pips:.1f}: using MARKET."
             )
 
         analysis_context = analysis_payload.get('context', {}) or {}
         market_metrics = analysis_payload.get('market_metrics') or analysis_context.get('market_metrics', {})
         atr_value = market_metrics.get('atr_short') or market_metrics.get('atr')
-        max_entry_atr_deviation = self.settings.get('MAX_ENTRY_ATR_DEVIATION', None)
 
-        if atr_value and max_entry_atr_deviation:
-            atr_deviation = deviation / atr_value if atr_value > 0 else 0
+        if atr_value and max_entry_atr_deviation is not None:
+            atr_deviation = deviation / atr_value if atr_value > 0 else 0.0
             if atr_deviation > max_entry_atr_deviation:
-                reasons.append(
+                decision_notes.append(
                     f"Entry deviation {atr_deviation:.2f} ATR > max {max_entry_atr_deviation:.2f}."
                 )
-                deviation_ok = False
-                self._logger.warning("❌ Entry deviation exceeds ATR limit; order rejected.")
-                return None
+                return FinalizedOrderParams(
+                    signal=signal,
+                    order_type='NONE',
+                    symbol=symbol,
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    lot_size=0.0,
+                    risk_amount_usd=0.0,
+                    rr_ratio=0.0,
+                    deviation_pips=deviation_pips,
+                    decision_notes=decision_notes,
+                    is_trade_allowed=False,
+                    reject_reason="Entry deviates beyond ATR threshold."
+                )
 
-        if final_entry != planned_entry:
-            entry_delta = final_entry - planned_entry
-            stop_loss = stop_loss + entry_delta
-            take_profit = take_profit + entry_delta
-            reasons.append("Adjusted SL/TP to preserve distances after entry update.")
+        sl_distance = planned_entry - stop_loss if signal == 'BUY' else stop_loss - planned_entry
+        tp_distance = take_profit - planned_entry if signal == 'BUY' else planned_entry - take_profit
+        if sl_distance <= 0 or tp_distance <= 0:
+            return FinalizedOrderParams(
+                signal=signal,
+                order_type='NONE',
+                symbol=symbol,
+                entry_price=planned_entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=0.0,
+                deviation_pips=deviation_pips,
+                decision_notes=["Invalid SL/TP distances from analyzer."],
+                is_trade_allowed=False,
+                reject_reason="SL/TP distances invalid for signal."
+            )
 
-        sl_distance = abs(final_entry - stop_loss)
-        rr_ratio = abs(take_profit - final_entry) / sl_distance if sl_distance > 0 else 0
+        if entry_price != planned_entry:
+            stop_loss = entry_price - sl_distance if signal == 'BUY' else entry_price + sl_distance
+            take_profit = entry_price + tp_distance if signal == 'BUY' else entry_price - tp_distance
+            decision_notes.append("Adjusted SL/TP to preserve distances after entry update.")
+
+        rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0.0
+
+        if rr_ratio < min_rr_ratio:
+            decision_notes.append(
+                f"RR {rr_ratio:.2f} below minimum {min_rr_ratio:.2f}."
+            )
+            return FinalizedOrderParams(
+                signal=signal,
+                order_type='NONE',
+                symbol=symbol,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=rr_ratio,
+                deviation_pips=deviation_pips,
+                decision_notes=decision_notes,
+                is_trade_allowed=False,
+                reject_reason="RR ratio below minimum."
+            )
 
         account_equity = config.get('ACCOUNT_BALANCE')
-        max_risk_usd = self.settings.get('SCALPING_RISK_USD', config.get('risk_settings.RISK_AMOUNT_USD'))
+        max_risk_usd = risk_settings.get('RISK_AMOUNT_USD')
+        if account_equity is None or max_risk_usd is None:
+            return FinalizedOrderParams(
+                signal=signal,
+                order_type='NONE',
+                symbol=symbol,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=rr_ratio,
+                deviation_pips=deviation_pips,
+                decision_notes=["Missing account balance or risk amount in config."],
+                is_trade_allowed=False,
+                reject_reason="Risk amount settings missing."
+            )
+
         current_session = self.get_current_scalping_session()
         risk_params = self.calculate_scalping_position_size(
             account_equity=account_equity,
-            entry_price=final_entry,
+            entry_price=entry_price,
             stop_loss=stop_loss,
             take_profit=take_profit,
             signal_confidence=confidence,
@@ -562,39 +688,55 @@ class ScalpingRiskManager:
         )
 
         if not risk_params.validation_passed:
-            self._logger.warning(f"❌ Risk validation failed: {risk_params.warnings}")
-            return None
+            decision_notes.extend(risk_params.warnings)
+            return FinalizedOrderParams(
+                signal=signal,
+                order_type='NONE',
+                symbol=symbol,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot_size=0.0,
+                risk_amount_usd=risk_params.risk_amount,
+                rr_ratio=rr_ratio,
+                deviation_pips=deviation_pips,
+                decision_notes=decision_notes,
+                is_trade_allowed=False,
+                reject_reason="Risk validation failed."
+            )
 
-        min_lot = self.GOLD_SPECS.get('min_lot') or self.GOLD_SPECS.get('MIN_LOT')
-        max_lot_spec = self.GOLD_SPECS.get('max_lot') or self.GOLD_SPECS.get('MAX_LOT')
-        max_lot_limit = self.settings.get('MAX_LOT_SIZE', max_lot_spec)
-        max_lot = min(max_lot_spec, max_lot_limit) if max_lot_spec else max_lot_limit
+        min_lot = gold_specs.get('MIN_LOT') or gold_specs.get('min_lot')
+        max_lot_spec = gold_specs.get('MAX_LOT') or gold_specs.get('max_lot')
+        max_lot_limit = risk_manager_config.get('MAX_LOT_SIZE')
+        lot_size = risk_params.lot_size
 
-        if min_lot and risk_params.lot_size <= min_lot:
-            reasons.append(f"Volume clamped to min lot {min_lot}.")
-        if max_lot and risk_params.lot_size >= max_lot:
-            reasons.append(f"Volume clamped to max lot {max_lot}.")
+        if min_lot is not None and lot_size < min_lot:
+            decision_notes.append(f"Lot clamped to min {min_lot}.")
+            lot_size = min_lot
+        if max_lot_limit is not None:
+            max_lot = min(max_lot_spec, max_lot_limit) if max_lot_spec is not None else max_lot_limit
+            if max_lot is not None and lot_size > max_lot:
+                decision_notes.append(f"Lot clamped to max {max_lot}.")
+                lot_size = max_lot
+
+        decision_notes.append(
+            f"Final entry {entry_price:.2f} SL {stop_loss:.2f} TP {take_profit:.2f} lot {lot_size:.3f}."
+        )
 
         return FinalizedOrderParams(
-            symbol=symbol,
             signal=signal,
             order_type=order_type,
-            volume=risk_params.lot_size,
-            planned_entry=planned_entry,
-            final_entry=final_entry,
-            sl=stop_loss,
-            tp=take_profit,
-            risk_usd=risk_params.risk_amount,
+            symbol=symbol,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            lot_size=lot_size,
+            risk_amount_usd=risk_params.risk_amount,
             rr_ratio=rr_ratio,
             deviation_pips=deviation_pips,
-            deviation_ok=deviation_ok,
-            reasons=reasons,
-            risk_details={
-                'risk_percent': risk_params.risk_percent,
-                'actual_risk_percent': risk_params.actual_risk_percent,
-                'scalping_specific': risk_params.scalping_specific,
-                'warnings': risk_params.warnings,
-            }
+            decision_notes=decision_notes,
+            is_trade_allowed=True,
+            reject_reason=None
         )
 
     def _validate_scalping_parameters(self, entry: float, sl: float, tp: float,
