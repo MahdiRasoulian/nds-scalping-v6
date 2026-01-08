@@ -62,7 +62,7 @@ def run_case(risk_manager, config_payload, name, analysis, live, expected_allowe
 
 def main():
     base_config = copy.deepcopy(config_manager.get_full_config())
-    risk_manager = create_scalping_risk_manager(config=config_manager)
+    risk_manager = create_scalping_risk_manager()
 
     max_dev = base_config["risk_settings"]["MAX_PRICE_DEVIATION_PIPS"]
     limit_conf = base_config["risk_settings"]["LIMIT_ORDER_MIN_CONFIDENCE"]

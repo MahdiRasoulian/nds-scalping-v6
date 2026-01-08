@@ -108,14 +108,14 @@ def main():
 
         # ۴. ایجاد مدیر ریسک اسکلپینگ با تنظیمات یکپارچه
         try:
-            risk_manager = create_scalping_risk_manager(config=scalping_config)
+            risk_manager = create_scalping_risk_manager(overrides=scalping_config)
             print("✅ مدیر ریسک اسکلپینگ با موفقیت ایجاد شد")
         except Exception as e:
             logger.error(f"❌ خطا در ایجاد مدیر ریسک اسکلپینگ: {e}", exc_info=True)
             print(f"❌ خطا در ایجاد مدیر ریسک اسکلپینگ: {e}")
             
             # ایجاد مدیر ریسک با تنظیمات ساده‌تر
-            risk_manager = create_scalping_risk_manager(config={})
+            risk_manager = create_scalping_risk_manager(overrides={})
             print("⚠️ مدیر ریسک با تنظیمات حداقلی ایجاد شد")
         
         # ۵. مقداردهی اولیه ربات (Dependency Injection)
