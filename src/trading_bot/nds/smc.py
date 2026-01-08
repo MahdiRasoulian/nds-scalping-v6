@@ -33,6 +33,24 @@ class SMCAnalyzer:
         if self.debug_smc:
             logger.debug(message, *args)
 
+    def _log_info(self, message: str, *args: Any) -> None:
+        logger.info(message, *args)
+
+    def _normalize_volatility_state(self, volatility_state: Optional[str]) -> Optional[str]:
+        if not volatility_state:
+            return None
+        state = str(volatility_state).upper()
+        mapping = {
+            "HIGH": "HIGH_VOLATILITY",
+            "LOW": "LOW_VOLATILITY",
+            "MODERATE": "MODERATE_VOLATILITY",
+        }
+        if state in mapping:
+            return mapping[state]
+        if state.endswith("_VOLATILITY"):
+            return state
+        return state
+
     def _prepare_data(self) -> None:
         """آماده‌سازی داده‌های پایه"""
         self.df = self.df.copy()
@@ -59,7 +77,7 @@ class SMCAnalyzer:
 
         if len(df) < period * 2 + 1:
             self._log_debug(
-                "Swing Detection: insufficient data (have=%s need=%s)",
+                "[NDS][SMC][SWINGS] insufficient data (have=%s need=%s)",
                 len(df),
                 period * 2 + 1,
             )
@@ -76,25 +94,36 @@ class SMCAnalyzer:
         low_indices = [i for i in low_series[low_series == low_rolling_min].index if i in valid_range]
 
         self._log_debug(
-            "Swing Detection: initial fractals high=%s low=%s",
+            "[NDS][SMC][SWINGS] initial fractals high=%s low=%s",
             len(high_indices),
             len(low_indices),
         )
 
         if not high_indices and not low_indices:
-            self._log_debug("Swing Detection: no initial fractals found")
+            self._log_debug("[NDS][SMC][SWINGS] no initial fractals found")
 
         min_distance = self.atr * self.settings.get('MIN_ATR_DISTANCE_MULTIPLIER', 1.2)
         min_vol_mult = self.settings.get('MIN_VOLUME_MULTIPLIER', 0.6)
+        has_volume = 'volume' in df.columns
 
         high_swings = []
         last_h_price = None
         for idx in high_indices:
             price = float(df['high'].iloc[idx])
-            avg_vol = df['volume'].iloc[max(0, idx - period):idx].mean() if 'volume' in df.columns else 1
-            if (df['volume'].iloc[idx] > avg_vol * min_vol_mult) and (
-                last_h_price is None or abs(price - last_h_price) >= min_distance
-            ):
+            volume_ok = True
+            avg_vol = 1.0
+            current_vol = None
+            if has_volume:
+                recent_vol = df['volume'].iloc[max(0, idx - period):idx]
+                avg_vol = float(recent_vol.mean()) if not recent_vol.empty else 1.0
+                if pd.isna(avg_vol):
+                    avg_vol = 1.0
+                current_vol = float(df['volume'].iloc[idx])
+                if pd.isna(current_vol):
+                    current_vol = avg_vol
+                volume_ok = current_vol >= avg_vol * min_vol_mult
+
+            if volume_ok and (last_h_price is None or abs(price - last_h_price) >= min_distance):
                 high_swings.append(SwingPoint(
                     index=idx,
                     price=price,
@@ -103,15 +132,33 @@ class SMCAnalyzer:
                     side='HIGH'
                 ))
                 last_h_price = price
+            self._log_debug(
+                "[NDS][SMC][SWINGS] high idx=%s price=%.2f volume_ok=%s avg_vol=%.2f current_vol=%s",
+                idx,
+                price,
+                volume_ok,
+                avg_vol,
+                f"{current_vol:.2f}" if current_vol is not None else "N/A",
+            )
 
         low_swings = []
         last_l_price = None
         for idx in low_indices:
             price = float(df['low'].iloc[idx])
-            avg_vol = df['volume'].iloc[max(0, idx - period):idx].mean() if 'volume' in df.columns else 1
-            if (df['volume'].iloc[idx] > avg_vol * min_vol_mult) and (
-                last_l_price is None or abs(price - last_l_price) >= min_distance
-            ):
+            volume_ok = True
+            avg_vol = 1.0
+            current_vol = None
+            if has_volume:
+                recent_vol = df['volume'].iloc[max(0, idx - period):idx]
+                avg_vol = float(recent_vol.mean()) if not recent_vol.empty else 1.0
+                if pd.isna(avg_vol):
+                    avg_vol = 1.0
+                current_vol = float(df['volume'].iloc[idx])
+                if pd.isna(current_vol):
+                    current_vol = avg_vol
+                volume_ok = current_vol >= avg_vol * min_vol_mult
+
+            if volume_ok and (last_l_price is None or abs(price - last_l_price) >= min_distance):
                 low_swings.append(SwingPoint(
                     index=idx,
                     price=price,
@@ -120,32 +167,40 @@ class SMCAnalyzer:
                     side='LOW'
                 ))
                 last_l_price = price
+            self._log_debug(
+                "[NDS][SMC][SWINGS] low idx=%s price=%.2f volume_ok=%s avg_vol=%.2f current_vol=%s",
+                idx,
+                price,
+                volume_ok,
+                avg_vol,
+                f"{current_vol:.2f}" if current_vol is not None else "N/A",
+            )
 
         self._log_debug(
-            "Swing Detection: initial swings high=%s low=%s",
+            "[NDS][SMC][SWINGS] initial swings high=%s low=%s",
             len(high_swings),
             len(low_swings),
         )
 
         all_swings = sorted(high_swings + low_swings, key=lambda x: x.index)
         if not all_swings:
-            self._log_debug("Swing Detection: no swings after filters")
+            self._log_debug("[NDS][SMC][SWINGS] no swings after filters")
             return []
 
         cleaned = self._clean_consecutive_swings(all_swings)
         if cleaned:
             all_swings = cleaned
-            self._log_debug("Swing Cleaning: %s swings", len(all_swings))
+            self._log_debug("[NDS][SMC][SWINGS] cleaning result=%s", len(all_swings))
         else:
-            self._log_debug("Swing Cleaning: all swings removed")
+            self._log_debug("[NDS][SMC][SWINGS] cleaning removed all swings")
             return []
 
         meaningful = self._filter_meaningful_swings(all_swings)
         if meaningful:
             all_swings = meaningful
-            self._log_debug("Meaningful Filter: %s swings", len(all_swings))
+            self._log_debug("[NDS][SMC][SWINGS] meaningful swings=%s", len(all_swings))
         else:
-            self._log_debug("Meaningful Filter: all swings removed")
+            self._log_debug("[NDS][SMC][SWINGS] meaningful filter removed all swings")
             return []
 
         last_h, last_l = None, None
@@ -163,13 +218,14 @@ class SMCAnalyzer:
                     swing.type = SwingType.LOW
                 last_l = swing
 
-        self._log_debug("Swing Detection Final: %s swings", len(all_swings))
+        self._log_debug("[NDS][SMC][SWINGS] final swings=%s", len(all_swings))
+        self._log_info("[NDS][SMC][SWINGS] detected swings=%s", len(all_swings))
         return all_swings
 
     def _clean_consecutive_swings(self, swings: List[SwingPoint]) -> List[SwingPoint]:
         """حذف سوینگ‌های تکراری در یک سمت برای به دست آوردن ساختار زیگزاگی تمیز"""
         if not swings:
-            self._log_debug("Swing Cleaning: empty input")
+            self._log_debug("[NDS][SMC][SWINGS] cleaning empty input")
             return []
 
         cleaned = []
@@ -182,10 +238,18 @@ class SMCAnalyzer:
             if last.side == s.side:
                 if s.side == 'HIGH' and s.price > last.price:
                     cleaned[-1] = s
-                    self._log_debug("Swing Cleaning: replace high %.2f -> %.2f", last.price, s.price)
+                    self._log_debug(
+                        "[NDS][SMC][SWINGS] replace high %.2f -> %.2f",
+                        last.price,
+                        s.price,
+                    )
                 elif s.side == 'LOW' and s.price < last.price:
                     cleaned[-1] = s
-                    self._log_debug("Swing Cleaning: replace low %.2f -> %.2f", last.price, s.price)
+                    self._log_debug(
+                        "[NDS][SMC][SWINGS] replace low %.2f -> %.2f",
+                        last.price,
+                        s.price,
+                    )
             else:
                 cleaned.append(s)
 
@@ -194,7 +258,7 @@ class SMCAnalyzer:
     def _filter_meaningful_swings(self, swings: List[SwingPoint]) -> List[SwingPoint]:
         """حذف نوسانات فرسایشی که حرکت قیمتی موثری ندارند"""
         if len(swings) < 3:
-            self._log_debug("Meaningful Filter: short list (%s swings)", len(swings))
+            self._log_debug("[NDS][SMC][SWINGS] meaningful short list (%s swings)", len(swings))
             return swings
 
         atr_threshold = self.atr * self.settings.get('MEANINGFUL_MOVE_MULT', 0.5)
@@ -319,7 +383,7 @@ class SMCAnalyzer:
             fvg.filled = filled
 
         unfilled_count = sum(1 for f in fvg_list if not f.filled)
-        logger.info("Detected %s FVGs (%s unfilled)", len(fvg_list), unfilled_count)
+        self._log_info("[NDS][SMC][FVG] detected=%s unfilled=%s", len(fvg_list), unfilled_count)
 
         return fvg_list
 
@@ -392,7 +456,7 @@ class SMCAnalyzer:
                 )
                 order_blocks.append(block)
 
-        logger.info("Detected %s raw order blocks", len(order_blocks))
+        self._log_info("[NDS][SMC][OB] detected raw=%s", len(order_blocks))
         return order_blocks[-5:]
 
     def detect_liquidity_sweeps(self, swings: List[SwingPoint], lookback_swings: int = 5) -> List[LiquiditySweep]:
@@ -416,7 +480,14 @@ class SMCAnalyzer:
             if candle_range < (atr_value * 0.5):
                 continue
 
-            rvol_value = float(row['rvol']) if 'rvol' in self.df.columns else 1.0
+            rvol_value = 1.0
+            if 'rvol' in self.df.columns:
+                try:
+                    rvol_value = float(row['rvol'])
+                except (TypeError, ValueError):
+                    rvol_value = 1.0
+                if pd.isna(rvol_value):
+                    rvol_value = 1.0
 
             for swing in recent_highs:
                 if row['time'] <= swing.time:
@@ -492,7 +563,7 @@ class SMCAnalyzer:
 
         unique_sweeps.reverse()
 
-        logger.info("Detected %s fresh liquidity sweeps", len(unique_sweeps))
+        self._log_info("[NDS][SMC][SWEEPS] detected fresh=%s", len(unique_sweeps))
         return unique_sweeps
 
     def determine_market_structure(
@@ -507,6 +578,8 @@ class SMCAnalyzer:
         تعیین ساختار بازار با منطق NDS (Nodal Displacement Sequencing)
         تمرکز بر جابجایی نودها (Displacement) و تقارن فرکتالی
         """
+        normalized_volatility = self._normalize_volatility_state(volatility_state)
+
         if len(swings) < 3:
             current_price = float(self.df['close'].iloc[-1])
             return MarketStructure(
@@ -518,15 +591,15 @@ class SMCAnalyzer:
                 current_price=current_price,
                 bos_choch_confidence=0.0,
                 volume_analysis=volume_analysis,
-                volatility_state=volatility_state,
+                volatility_state=normalized_volatility,
                 adx_value=adx_value,
-                structure_score=10.0
+                structure_score=8.0
             )
 
         # در اسکلپینگ XAUUSD، کاهش فیلتر ATR در نوسان بالا از حذف نودهای مفید جلوگیری می‌کند.
-        if volatility_state == "HIGH_VOLATILITY":
+        if normalized_volatility == "HIGH_VOLATILITY":
             dynamic_multiplier = 0.75
-        elif volatility_state == "LOW_VOLATILITY":
+        elif normalized_volatility == "LOW_VOLATILITY":
             dynamic_multiplier = 1.1
         else:
             dynamic_multiplier = 1.0
@@ -557,7 +630,7 @@ class SMCAnalyzer:
             recent_swings,
             current_price,
             volume_analysis,
-            volatility_state,
+            normalized_volatility,
             adx_value,
         )
 
@@ -578,7 +651,7 @@ class SMCAnalyzer:
             trend=trend,
             trend_strength=trend_strength,
             volume_analysis=volume_analysis,
-            volatility_state=volatility_state,
+            volatility_state=normalized_volatility,
         )
 
         range_width, range_mid = None, None
@@ -596,7 +669,7 @@ class SMCAnalyzer:
             confidence=bos_choch_confidence,
             trend_strength=trend_strength,
             volume_analysis=volume_analysis,
-            volatility_state=volatility_state,
+            volatility_state=normalized_volatility,
             range_width=range_width,
             last_high=last_high,
             last_low=last_low,
@@ -606,6 +679,11 @@ class SMCAnalyzer:
         if nds_displacement:
             # بونوس محدود برای جابجایی معتبر نودها، بدون تغییر BOS برای جلوگیری از سیگنال‌های کاذب.
             structure_score = min(100.0, structure_score + 10.0)
+
+        structure_score = max(0.0, min(100.0, structure_score))
+        volume_payload = dict(volume_analysis) if volume_analysis else None
+        if volume_payload is not None:
+            volume_payload.setdefault("nds_displacement", nds_displacement)
 
         structure = MarketStructure(
             trend=trend,
@@ -617,14 +695,14 @@ class SMCAnalyzer:
             range_width=range_width,
             range_mid=range_mid,
             bos_choch_confidence=bos_choch_confidence,
-            volume_analysis=volume_analysis,
-            volatility_state=volatility_state,
+            volume_analysis=volume_payload,
+            volatility_state=normalized_volatility,
             adx_value=adx_value,
             structure_score=structure_score,
         )
 
-        logger.info(
-            "🏛️ NDS Structure: Trend=%s, BOS=%s, CHoCH=%s, Conf=%.1f%%, Score=%.1f",
+        self._log_info(
+            "[NDS][SMC][STRUCTURE] Trend=%s BOS=%s CHOCH=%s Conf=%.1f%% Score=%.1f",
             trend.value,
             bos,
             choch,
@@ -771,12 +849,15 @@ class SMCAnalyzer:
             trend = MarketTrend.RANGING
             strength = 0.3
 
-        if adx_value:
+        if adx_value is not None:
             adx_strength = adx_value / 100.0
             strength = (strength * 0.6) + (adx_strength * 0.4)
 
         if volume_analysis:
-            volume_factor = min(volume_analysis.get('rvol', 1.0), 2.0) / 2.0
+            volume_factor = volume_analysis.get('rvol', 1.0)
+            if volume_factor is None or pd.isna(volume_factor):
+                volume_factor = 1.0
+            volume_factor = min(float(volume_factor), 2.0) / 2.0
             strength = strength * (0.7 + 0.3 * volume_factor)
 
         confidence = strength * 0.7
@@ -786,6 +867,12 @@ class SMCAnalyzer:
         elif volatility_state == "LOW_VOLATILITY":
             confidence *= 0.9
 
+        self._log_debug(
+            "[NDS][SMC][STRUCTURE] trend=%s strength=%.2f confidence=%.2f",
+            trend.value,
+            strength,
+            confidence,
+        )
         return trend, strength, min(1.0, confidence)
 
     def _detect_bos_choch(
@@ -808,7 +895,7 @@ class SMCAnalyzer:
         confidence = 0.0
 
         if not last_high or not last_low:
-            self._log_debug("BOS/CHOCH: insufficient swings")
+            self._log_debug("[NDS][SMC][BOS_CHOCH] insufficient swings")
             return bos, choch, confidence
 
         base_buffer = self._calculate_dynamic_buffer(
@@ -853,6 +940,12 @@ class SMCAnalyzer:
             df=self.df,
         )
 
+        self._log_debug(
+            "[NDS][SMC][BOS_CHOCH] result bos=%s choch=%s conf=%.2f",
+            final_bos,
+            final_choch,
+            final_confidence,
+        )
         return final_bos, final_choch, final_confidence
 
     def _calculate_dynamic_buffer(
@@ -903,7 +996,10 @@ class SMCAnalyzer:
     ) -> bool:
         """تأیید شکست با الگوهای کندل استیک"""
         candle_size = abs(current_high - current_low)
-        body_size = abs(current_close - ((current_high + current_low) / 2))
+        current_open = float(self.df['open'].iloc[-1])
+        if pd.isna(current_open):
+            return False
+        body_size = abs(current_close - current_open)
 
         if trend == MarketTrend.UPTREND:
             if current_close > last_high_price and (current_close - last_high_price) > (candle_size * 0.3):
@@ -1008,6 +1104,15 @@ class SMCAnalyzer:
         price_break = False
         price_signal = ""
 
+        self._log_debug(
+            "[NDS][SMC][BOS_CHOCH] BOS check trend=%s last_high=%.2f last_low=%.2f close=%.2f buffer=%.4f",
+            trend.value,
+            last_high_price,
+            last_low_price,
+            current_close,
+            base_buffer.get('bos', 0.0),
+        )
+
         if trend == MarketTrend.UPTREND:
             if current_close > (last_high_price + base_buffer['bos']):
                 price_break = True
@@ -1030,6 +1135,11 @@ class SMCAnalyzer:
             last_low_price,
             trend,
         )
+        self._log_debug(
+            "[NDS][SMC][BOS_CHOCH] BOS confirmations volume=%s candle=%s",
+            volume_confirmation,
+            candle_confirmation,
+        )
 
         if price_break:
             confidence = 0.4
@@ -1042,7 +1152,7 @@ class SMCAnalyzer:
 
             if confidence >= 0.6:
                 bos = price_signal
-                self._log_debug("BOS confirmed: %s (%.1f%%)", bos, confidence * 100)
+                self._log_debug("[NDS][SMC][BOS_CHOCH] BOS confirmed=%s conf=%.1f%%", bos, confidence * 100)
 
         return bos, confidence
 
@@ -1066,6 +1176,15 @@ class SMCAnalyzer:
 
         last_high_price = last_high.price
         last_low_price = last_low.price
+
+        self._log_debug(
+            "[NDS][SMC][BOS_CHOCH] CHOCH check trend=%s last_high=%.2f last_low=%.2f close=%.2f buffer=%.4f",
+            trend.value,
+            last_high_price,
+            last_low_price,
+            current_close,
+            base_buffer.get('choch', 0.0),
+        )
 
         if trend == MarketTrend.UPTREND:
             if current_close < (last_low_price - base_buffer['choch']):
@@ -1115,13 +1234,13 @@ class SMCAnalyzer:
             if bos == "BULLISH_BOS":
                 bearish_pressure = self._calculate_bearish_pressure(recent_candles)
                 if bearish_pressure > 0.7:
-                    self._log_debug("Bullish BOS with high bearish pressure")
+                    self._log_debug("[NDS][SMC][BOS_CHOCH] Bullish BOS high bearish pressure")
                     final_confidence *= 0.7
 
             elif bos == "BEARISH_BOS":
                 bullish_pressure = self._calculate_bullish_pressure(recent_candles)
                 if bullish_pressure > 0.7:
-                    self._log_debug("Bearish BOS with high bullish pressure")
+                    self._log_debug("[NDS][SMC][BOS_CHOCH] Bearish BOS high bullish pressure")
                     final_confidence *= 0.7
 
         if final_confidence < 0.5:

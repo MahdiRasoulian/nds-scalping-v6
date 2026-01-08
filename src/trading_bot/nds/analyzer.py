@@ -58,8 +58,8 @@ class GoldNDSAnalyzer:
         self.timeframe = self._detect_timeframe()
         self._apply_timeframe_settings()
 
-        logger.info(
-            "✅ NDS Analyzer v6.0 initialized with %s candles | Timeframe: %s",
+        self._log_info(
+            "[NDS][INIT] initialized candles=%s timeframe=%s",
             len(self.df),
             self.timeframe,
         )
@@ -143,17 +143,17 @@ class GoldNDSAnalyzer:
                     parsed_value = None
 
             if parsed_value is None:
-                self._log_debug("Ignored analyzer setting: %s=%s", key, value)
+                self._log_debug("[NDS][INIT] ignored setting %s=%s", key, value)
                 continue
 
             validated_config[key] = parsed_value
 
         if validated_config:
             self.GOLD_SETTINGS.update(validated_config)
-            self._log_debug("Applied %s analyzer settings from config", len(validated_config))
+            self._log_debug("[NDS][INIT] applied analyzer settings=%s", len(validated_config))
 
         if ignored_keys:
-            self._log_debug("Ignored non-analysis config keys: %s", sorted(set(ignored_keys)))
+            self._log_debug("[NDS][INIT] ignored non-analysis keys=%s", sorted(set(ignored_keys)))
 
     def _apply_sessions_config(self, sessions_config: Dict[str, Any]) -> None:
         """اعمال تنظیمات سشن‌ها از config متمرکز"""
@@ -173,11 +173,33 @@ class GoldNDSAnalyzer:
             else:
                 self.TRADING_SESSIONS[standard_name] = converted_session
 
-            self._log_debug("Applied session config: %s = %s", standard_name, converted_session)
+            self._log_debug("[NDS][SESSIONS] applied config %s=%s", standard_name, converted_session)
 
     def _log_debug(self, message: str, *args: Any) -> None:
         if self.debug_analyzer:
             logger.debug(message, *args)
+
+    def _log_info(self, message: str, *args: Any) -> None:
+        logger.info(message, *args)
+
+    def _normalize_volatility_state(self, volatility_state: Optional[str]) -> str:
+        if not volatility_state:
+            return "MODERATE_VOLATILITY"
+        state = str(volatility_state).upper()
+        mapping = {
+            "HIGH": "HIGH_VOLATILITY",
+            "LOW": "LOW_VOLATILITY",
+            "MODERATE": "MODERATE_VOLATILITY",
+        }
+        if state in mapping:
+            return mapping[state]
+        if state.endswith("_VOLATILITY"):
+            return state
+        return "MODERATE_VOLATILITY"
+
+    def _append_reason(self, reasons: List[str], reason: str) -> None:
+        reasons.append(reason)
+        self._log_debug("[NDS][REASONS] %s", reason)
 
     def _validate_dataframe(self) -> None:
         """اعتبارسنجی DataFrame ورودی"""
@@ -189,7 +211,7 @@ class GoldNDSAnalyzer:
         self.df['time'] = pd.to_datetime(self.df['time'], utc=True)
 
         if len(self.df) > 1 and self.df['time'].iloc[0] > self.df['time'].iloc[-1]:
-            logger.warning("DataFrame not sorted chronologically. Sorting...")
+            logger.warning("[NDS][INIT] DataFrame not sorted chronologically. Sorting...")
             self.df = self.df.sort_values('time').reset_index(drop=True)
 
         if 'volume' not in self.df.columns:
@@ -240,7 +262,7 @@ class GoldNDSAnalyzer:
         """اعمال تنظیمات اختصاصی تایم‌فریم"""
         tf_settings = self.timeframe_specifics.get(self.timeframe)
         if not tf_settings:
-            self._log_debug("Missing TIMEFRAME_SPECIFICS for timeframe: %s", self.timeframe)
+            self._log_debug("[NDS][INIT] missing TIMEFRAME_SPECIFICS timeframe=%s", self.timeframe)
             return
         self.GOLD_SETTINGS.update(tf_settings)
 
@@ -251,6 +273,8 @@ class GoldNDSAnalyzer:
 
         session_info = self._is_valid_trading_session(last_time)
         rvol = float(volume_analysis.get('rvol', 1.0))
+        if pd.isna(rvol):
+            rvol = 1.0
         volume_trend = volume_analysis.get('volume_trend', 'NEUTRAL')
 
         if rvol > 1.2 or volume_trend == 'INCREASING':
@@ -271,7 +295,13 @@ class GoldNDSAnalyzer:
             optimal_trading=session_info.get('optimal_trading', session_info.get('weight', 0.5) >= 1.2)
         )
 
-        logger.info("🏛️ Session Analysis: %s (Weight: %.1f)", analysis.current_session, analysis.weight)
+        self._log_info(
+            "[NDS][SESSIONS] current=%s weight=%.2f activity=%s overlap=%s",
+            analysis.current_session,
+            analysis.weight,
+            analysis.session_activity,
+            analysis.is_overlap,
+        )
         return analysis
 
     def _hour_in_session(self, hour: int, start: int, end: int) -> bool:
@@ -355,7 +385,7 @@ class GoldNDSAnalyzer:
         نسخه تحلیل‌محور: خروجی فقط ایده معاملاتی (بدون منطق اجرا/ریسک).
         """
         mode = "Scalping" if scalping_mode else "Regular"
-        logger.info("🎯 Starting Gold NDS %s Analysis v6.0 (Analysis Only)...", mode)
+        self._log_info("[NDS][INIT] start analysis mode=%s analysis_only=true", mode)
 
         try:
             atr_window = self.GOLD_SETTINGS.get('ATR_WINDOW', 14)
@@ -367,6 +397,15 @@ class GoldNDSAnalyzer:
             adx_window = self.GOLD_SETTINGS.get('ADX_WINDOW', 14)
             self.df, adx_v, plus_di, minus_di, di_trend = IndicatorCalculator.calculate_adx(self.df, adx_window)
 
+            self._log_info(
+                "[NDS][INDICATORS] atr=%.2f adx=%.2f plus_di=%.2f minus_di=%.2f di_trend=%s",
+                atr_v,
+                adx_v,
+                plus_di,
+                minus_di,
+                di_trend,
+            )
+
             if scalping_mode:
                 atr_short_df, _ = IndicatorCalculator.calculate_atr(self.df.copy(), 7)
                 atr_short_value = float(atr_short_df['atr_7'].iloc[-1])
@@ -376,8 +415,19 @@ class GoldNDSAnalyzer:
             atr_for_scoring = atr_short_value if (scalping_mode and atr_short_value) else atr_v
 
             volume_analysis = IndicatorCalculator.analyze_volume(self.df, 5 if scalping_mode else 20)
-            volatility_state = self._determine_volatility(atr_v, atr_for_scoring)
+            volatility_state = self._normalize_volatility_state(self._determine_volatility(atr_v, atr_for_scoring))
             session_analysis = self._analyze_trading_sessions(volume_analysis)
+
+            last_candle = self.df.iloc[-1]
+            self._log_debug(
+                "[NDS][INDICATORS] last_candle time=%s open=%.2f high=%.2f low=%.2f close=%.2f rvol=%.2f",
+                last_candle['time'],
+                last_candle['open'],
+                last_candle['high'],
+                last_candle['low'],
+                last_candle['close'],
+                float(volume_analysis.get('rvol', 1.0)),
+            )
 
             smc = SMCAnalyzer(self.df, self.atr, self.GOLD_SETTINGS)
             swings = smc.detect_swings(timeframe)
@@ -393,7 +443,7 @@ class GoldNDSAnalyzer:
                 adx_value=adx_v,
             )
 
-            logger.info("✅ ساختار شناسایی شده: %s", structure)
+            self._log_info("[NDS][SMC][STRUCTURE] %s", structure)
 
             final_structure = self._apply_adx_override(structure, adx_v, plus_di, minus_di)
 
@@ -420,6 +470,14 @@ class GoldNDSAnalyzer:
             )
 
             signal = self._determine_signal(score, confidence, volatility_state, scalping_mode)
+
+            self._log_info(
+                "[NDS][RESULT] score=%.1f confidence=%.1f signal=%s volatility=%s",
+                score,
+                confidence,
+                signal,
+                volatility_state,
+            )
 
             result_payload = self._build_initial_result(
                 signal=signal,
@@ -481,7 +539,7 @@ class GoldNDSAnalyzer:
             )
 
         except Exception as e:
-            logger.error("❌ Analysis failed: %s", str(e), exc_info=True)
+            logger.error("[NDS][RESULT] analysis failed: %s", str(e), exc_info=True)
             return self._create_error_result(str(e), timeframe, current_close=None)
 
     def _calculate_recent_range(self, scalping_mode: bool) -> float:
@@ -504,12 +562,20 @@ class GoldNDSAnalyzer:
         if raw_score is None:
             return 0.0
         score = float(raw_score)
-        if score <= 1.5:
-            score *= 100
+        normalized = score
+        if score <= 1.05:
+            normalized = score * 100
         elif score <= 10:
-            score *= 10
-        score = max(0.0, min(100.0, score))
-        return score
+            normalized = score * 10
+        else:
+            normalized = score
+        normalized = max(0.0, min(100.0, float(normalized)))
+        self._log_debug(
+            "[NDS][SCORE] structure_score raw=%.2f normalized=%.2f",
+            score,
+            normalized,
+        )
+        return normalized
 
     def _bounded(self, value: float, minimum: float = -1.0, maximum: float = 1.0) -> float:
         return max(minimum, min(maximum, value))
@@ -548,15 +614,15 @@ class GoldNDSAnalyzer:
 
         bos_confirmed = structure.bos in {"BULLISH_BOS", "BEARISH_BOS"}
         if require_bos and not bos_confirmed:
-            self._log_debug("ADX override blocked: BOS required")
+            self._log_debug("[NDS][FILTER] ADX override blocked: BOS required")
             return structure
 
         if not di_persist:
-            self._log_debug("ADX override blocked: DI persistence not met")
+            self._log_debug("[NDS][FILTER] ADX override blocked: DI persistence not met")
             return structure
 
         new_trend = MarketTrend.UPTREND if dominance == "BULLISH" else MarketTrend.DOWNTREND
-        logger.info("🚀 ADX Override applied: %s", new_trend.value)
+        self._log_info("[NDS][FILTER] ADX override applied trend=%s", new_trend.value)
         return MarketStructure(
             trend=new_trend,
             bos=structure.bos,
@@ -619,17 +685,17 @@ class GoldNDSAnalyzer:
         choch_component = 0.0
         if structure.bos == "BULLISH_BOS":
             bos_component = 1.0
-            reasons.append("✅ Bullish BOS")
+            self._append_reason(reasons, "✅ Bullish BOS")
         elif structure.bos == "BEARISH_BOS":
             bos_component = -1.0
-            reasons.append("🔻 Bearish BOS")
+            self._append_reason(reasons, "🔻 Bearish BOS")
 
-        if structure.choch == "BULLISH_CHoCH":
+        if structure.choch == "BULLISH_CHOCH":
             choch_component = 1.0
-            reasons.append("✅ Bullish CHoCH")
-        elif structure.choch == "BEARISH_CHoCH":
+            self._append_reason(reasons, "✅ Bullish CHOCH")
+        elif structure.choch == "BEARISH_CHOCH":
             choch_component = -1.0
-            reasons.append("🔻 Bearish CHoCH")
+            self._append_reason(reasons, "🔻 Bearish CHOCH")
 
         structure_component = self._bounded((structure_score - 50.0) / 50.0)
         structure_sub = self._bounded(
@@ -641,10 +707,10 @@ class GoldNDSAnalyzer:
         trend_dir = 0.0
         if structure.trend.value == "UPTREND":
             trend_dir = 1.0
-            reasons.append(f"📈 Uptrend (ADX: {adx_value:.1f})")
+            self._append_reason(reasons, f"📈 Uptrend (ADX: {adx_value:.1f})")
         elif structure.trend.value == "DOWNTREND":
             trend_dir = -1.0
-            reasons.append(f"📉 Downtrend (ADX: {adx_value:.1f})")
+            self._append_reason(reasons, f"📉 Downtrend (ADX: {adx_value:.1f})")
 
         trend_strength = min(1.0, max(0.0, adx_value / 40.0))
         rvol = float(volume_analysis.get('rvol', 1.0))
@@ -678,8 +744,17 @@ class GoldNDSAnalyzer:
                     'strength': fvg.strength,
                     'score': fvg_value,
                 }
-                reasons.append(
-                    f"{'🟢' if sign > 0 else '🔴'} {fvg.type.value} (Size: ${fvg.size:.2f})"
+                self._append_reason(
+                    reasons,
+                    f"{'🟢' if sign > 0 else '🔴'} {fvg.type.value} (Size: ${fvg.size:.2f})",
+                )
+            else:
+                self._log_debug(
+                    "[NDS][SMC][FVG] skipped index=%s price=%.2f range=(%.2f,%.2f)",
+                    fvg.index,
+                    current_price,
+                    fvg.bottom,
+                    fvg.top,
                 )
 
         if fvg_values:
@@ -688,20 +763,24 @@ class GoldNDSAnalyzer:
 
         sweep_values: List[float] = []
         for idx, sweep in enumerate(sweeps[-3:]):
-            sign = 1.0 if sweep.type == 'BULLISH_SWEEP' else -1.0
-            penetration_ratio = sweep.penetration / atr_value if atr_value > 0 else 0.0
+            sweep_type = getattr(sweep, 'type', 'UNKNOWN')
+            sweep_penetration = float(getattr(sweep, 'penetration', 0.0))
+            sweep_strength = float(getattr(sweep, 'strength', 1.0))
+            sign = 1.0 if sweep_type == 'BULLISH_SWEEP' else -1.0
+            penetration_ratio = sweep_penetration / atr_value if atr_value > 0 else 0.0
             penetration_score = min(1.0, penetration_ratio / 1.5)
-            strength_score = min(1.0, sweep.strength / 2.0)
+            strength_score = min(1.0, sweep_strength / 2.0)
             sweep_value = self._bounded(sign * (0.6 * penetration_score + 0.4 * strength_score))
             sweep_values.append(sweep_value)
             breakdown['raw_signals'][f"sweep_{idx}"] = {
-                'type': sweep.type,
-                'penetration': sweep.penetration,
-                'strength': sweep.strength,
+                'type': sweep_type,
+                'penetration': sweep_penetration,
+                'strength': sweep_strength,
                 'score': sweep_value,
             }
-            reasons.append(
-                f"{'✅' if sign > 0 else '🔻'} {sweep.type} (Penetration: ${sweep.penetration:.2f})"
+            self._append_reason(
+                reasons,
+                f"{'✅' if sign > 0 else '🔻'} {sweep_type} (Penetration: ${sweep_penetration:.2f})",
             )
 
         sweep_sub = self._bounded(sum(sweep_values) / len(sweep_values)) if sweep_values else 0.0
@@ -710,8 +789,14 @@ class GoldNDSAnalyzer:
         ob_values: List[float] = []
         recent_obs = order_blocks[-5:] if order_blocks else []
         for idx, ob in enumerate(recent_obs):
-            distance_atr = abs(current_price - ob.mid) / atr_value if atr_value > 0 else 999.0
+            ob_mid = getattr(ob, 'mid', (ob.high + ob.low) / 2)
+            distance_atr = abs(current_price - ob_mid) / atr_value if atr_value > 0 else 999.0
             if distance_atr > 1.0:
+                self._log_debug(
+                    "[NDS][SMC][OB] skipped type=%s distance_atr=%.2f",
+                    ob.type,
+                    distance_atr,
+                )
                 continue
             sign = 1.0 if ob.type == 'BULLISH_OB' else -1.0
             distance_score = max(0.0, 1.0 - distance_atr)
@@ -724,8 +809,9 @@ class GoldNDSAnalyzer:
                 'distance_atr': distance_atr,
                 'score': ob_value,
             }
-            reasons.append(
-                f"{'🟢' if sign > 0 else '🔴'} {ob.type} (Strength: {ob.strength:.1f})"
+            self._append_reason(
+                reasons,
+                f"{'🟢' if sign > 0 else '🔴'} {ob.type} (Strength: {ob.strength:.1f})",
             )
 
         ob_sub = self._bounded(sum(ob_values) / len(ob_values)) if ob_values else 0.0
@@ -751,6 +837,12 @@ class GoldNDSAnalyzer:
             'structure_score': structure_score,
         }
 
+        self._log_debug(
+            "[NDS][SCORE] total_weighted=%.2f score=%.2f sub_scores=%s",
+            total_weighted,
+            score,
+            breakdown['sub_scores'],
+        )
         return score, reasons, breakdown
 
     def _calculate_confidence(
@@ -765,9 +857,10 @@ class GoldNDSAnalyzer:
         """محاسبه اعتماد سیگنال"""
         base_confidence = abs(normalized_score - 50) * 2.4
 
-        if volatility_state in ['HIGH_VOLATILITY', 'HIGH']:
+        volatility_state = self._normalize_volatility_state(volatility_state)
+        if volatility_state == 'HIGH_VOLATILITY':
             base_confidence *= 1.1 if scalping_mode else 0.8
-        elif volatility_state in ['LOW_VOLATILITY', 'LOW']:
+        elif volatility_state == 'LOW_VOLATILITY':
             base_confidence *= 0.9 if scalping_mode else 1.2
 
         if session_analysis.optimal_trading:
@@ -778,6 +871,8 @@ class GoldNDSAnalyzer:
             base_confidence *= session_penalty
 
         current_rvol = float(volume_analysis.get('rvol', 1.0))
+        if pd.isna(current_rvol):
+            current_rvol = 1.0
         if current_rvol > 2.0:
             base_confidence *= 1.25
         elif current_rvol < 0.5:
@@ -787,13 +882,14 @@ class GoldNDSAnalyzer:
 
         if sweeps:
             for sweep in sweeps:
-                if normalized_score > 55 and sweep.type == 'BEARISH_SWEEP':
+                sweep_type = getattr(sweep, 'type', None)
+                if normalized_score > 55 and sweep_type == 'BEARISH_SWEEP':
                     base_confidence *= 0.8
-                elif normalized_score > 55 and sweep.type == 'BULLISH_SWEEP':
+                elif normalized_score > 55 and sweep_type == 'BULLISH_SWEEP':
                     base_confidence *= 1.15
-                elif normalized_score < 45 and sweep.type == 'BULLISH_SWEEP':
+                elif normalized_score < 45 and sweep_type == 'BULLISH_SWEEP':
                     base_confidence *= 0.8
-                elif normalized_score < 45 and sweep.type == 'BEARISH_SWEEP':
+                elif normalized_score < 45 and sweep_type == 'BEARISH_SWEEP':
                     base_confidence *= 1.15
 
         volume_trend = volume_analysis.get('volume_trend', 'NEUTRAL')
@@ -815,10 +911,11 @@ class GoldNDSAnalyzer:
     ) -> str:
         """تعیین سیگنال با آستانه‌های پویا (بدون فیلتر اعتماد)"""
         if scalping_mode:
-            if volatility_state in ['HIGH_VOLATILITY', 'HIGH']:
+            volatility_state = self._normalize_volatility_state(volatility_state)
+            if volatility_state == 'HIGH_VOLATILITY':
                 buy_threshold = 60
                 sell_threshold = 40
-            elif volatility_state in ['LOW_VOLATILITY', 'LOW']:
+            elif volatility_state == 'LOW_VOLATILITY':
                 buy_threshold = 65
                 sell_threshold = 35
             else:
@@ -861,6 +958,10 @@ class GoldNDSAnalyzer:
             getattr(structure, 'structure_score', 0.0)
         )
 
+        current_rvol = float(volume_analysis.get('rvol', 1.0))
+        if pd.isna(current_rvol):
+            current_rvol = 1.0
+
         result = {
             "signal": signal,
             "confidence": confidence,
@@ -884,7 +985,7 @@ class GoldNDSAnalyzer:
                 "recent_range": round(recent_range, 2),
                 "recent_position": round(recent_position, 2),
                 "volatility_state": volatility_state,
-                "current_rvol": round(float(volume_analysis.get('rvol', 1.0)), 2),
+                "current_rvol": round(current_rvol, 2),
             },
             "analysis_data": {
                 "volume_analysis": volume_analysis,
@@ -922,7 +1023,7 @@ class GoldNDSAnalyzer:
         original_signal = analysis_result.get('signal', 'NONE')
         reasons = analysis_result.get('reasons', [])
 
-        self._log_debug("Final filter start | signal=%s", original_signal)
+        self._log_debug("[NDS][FILTER] start signal=%s", original_signal)
 
         if original_signal != 'NONE':
             settings = self.GOLD_SETTINGS
@@ -935,7 +1036,7 @@ class GoldNDSAnalyzer:
                 adaptive_min_rvol = self._adaptive_min_rvol(base_min_rvol, structure_score)
 
                 self._log_debug(
-                    "RVOL filter | base=%.2f current=%.2f structure_score=%.1f adaptive=%.2f",
+                    "[NDS][FILTER] rvol base=%.2f current=%.2f structure_score=%.1f adaptive=%.2f",
                     base_min_rvol,
                     current_rvol,
                     structure_score,
@@ -944,11 +1045,13 @@ class GoldNDSAnalyzer:
 
                 if current_rvol < adaptive_min_rvol:
                     analysis_result['signal'] = 'NONE'
-                    reasons.append(
+                    self._append_reason(
+                        reasons,
                         f"Volume too low (RVOL: {current_rvol:.2f} < {adaptive_min_rvol:.2f})"
                     )
                 elif adaptive_min_rvol < base_min_rvol:
-                    reasons.append(
+                    self._append_reason(
+                        reasons,
                         f"Volume accepted due to high structure score ({structure_score:.1f})"
                     )
 
@@ -961,7 +1064,7 @@ class GoldNDSAnalyzer:
                 confidence_type = "NORMAL"
 
             self._log_debug(
-                "Confidence filter | current=%.1f%% %s_min=%.1f%%",
+                "[NDS][FILTER] confidence current=%.1f%% %s_min=%.1f%%",
                 current_confidence,
                 confidence_type,
                 min_confidence,
@@ -969,7 +1072,8 @@ class GoldNDSAnalyzer:
 
             if current_confidence < min_confidence:
                 analysis_result['signal'] = 'NONE'
-                reasons.append(
+                self._append_reason(
+                    reasons,
                     f"Confidence too low ({current_confidence:.1f}% < {min_confidence}%)"
                 )
 
@@ -978,14 +1082,15 @@ class GoldNDSAnalyzer:
             min_session_weight = settings.get('MIN_SESSION_WEIGHT', 0.3)
 
             self._log_debug(
-                "Session filter | weight=%.2f min_weight=%.2f",
+                "[NDS][FILTER] session weight=%.2f min=%.2f",
                 session_weight,
                 min_session_weight,
             )
 
             if session_weight < min_session_weight:
                 analysis_result['signal'] = 'NONE'
-                reasons.append(
+                self._append_reason(
+                    reasons,
                     f"Low session weight ({session_weight:.2f} < {min_session_weight})"
                 )
 
@@ -994,14 +1099,15 @@ class GoldNDSAnalyzer:
             min_structure_score = settings.get('MIN_STRUCTURE_SCORE', 20.0)
 
             self._log_debug(
-                "Structure filter | score=%.1f min_score=%.1f",
+                "[NDS][FILTER] structure score=%.1f min=%.1f",
                 structure_score,
                 min_structure_score,
             )
 
             if structure_score < min_structure_score:
                 analysis_result['signal'] = 'NONE'
-                reasons.append(
+                self._append_reason(
+                    reasons,
                     f"Weak market structure (Score: {structure_score:.1f} < {min_structure_score})"
                 )
 
@@ -1010,13 +1116,13 @@ class GoldNDSAnalyzer:
 
         if original_signal != final_signal:
             self._log_debug(
-                "Final filter changed signal | original=%s final=%s reasons=%s",
+                "[NDS][FILTER] changed signal original=%s final=%s reasons=%s",
                 original_signal,
                 final_signal,
                 reasons,
             )
         else:
-            self._log_debug("Final filter result | signal=%s", final_signal)
+            self._log_debug("[NDS][FILTER] result signal=%s", final_signal)
 
         return analysis_result
 
@@ -1045,6 +1151,14 @@ class GoldNDSAnalyzer:
             "take_profit": None,
             "reason": None,
         }
+
+        self._log_debug(
+            "[NDS][ENTRY_IDEA] start signal=%s atr=%.2f entry_factor=%.2f price=%.2f",
+            signal,
+            atr_value,
+            entry_factor,
+            current_price,
+        )
 
         if atr_value is None or atr_value <= 0:
             idea["reason"] = "Invalid ATR for entry idea"
@@ -1081,6 +1195,13 @@ class GoldNDSAnalyzer:
             idea["stop_loss"] = stop
             idea["take_profit"] = target
             idea["reason"] = reason
+            self._log_debug(
+                "[NDS][ENTRY_IDEA] finalized entry=%.2f stop=%.2f target=%.2f reason=%s",
+                entry,
+                stop,
+                target,
+                reason,
+            )
             return idea
 
         swing_anchor = self._select_swing_anchor(structure, signal)
@@ -1093,6 +1214,13 @@ class GoldNDSAnalyzer:
             ]
             best_fvg = max(target_fvgs, key=lambda x: x.strength) if target_fvgs else None
             if best_fvg:
+                self._log_debug(
+                    "[NDS][ENTRY_IDEA] bullish FVG selected index=%s top=%.2f bottom=%.2f strength=%.2f",
+                    best_fvg.index,
+                    best_fvg.top,
+                    best_fvg.bottom,
+                    best_fvg.strength,
+                )
                 fvg_height = best_fvg.height
                 entry = best_fvg.top - (fvg_height * entry_factor)
                 stop = (swing_anchor - atr_value * buffer_mult) if swing_anchor else best_fvg.bottom - (atr_value * 0.5)
@@ -1102,6 +1230,13 @@ class GoldNDSAnalyzer:
             bullish_obs = [ob for ob in order_blocks if ob.type == 'BULLISH_OB']
             if bullish_obs:
                 best_ob = max(bullish_obs, key=lambda x: x.strength)
+                self._log_debug(
+                    "[NDS][ENTRY_IDEA] bullish OB selected index=%s high=%.2f low=%.2f strength=%.2f",
+                    best_ob.index,
+                    best_ob.high,
+                    best_ob.low,
+                    best_ob.strength,
+                )
                 entry = best_ob.low + (best_ob.high - best_ob.low) * 0.3
                 stop = (swing_anchor - atr_value * buffer_mult) if swing_anchor else best_ob.low - (atr_value * 0.5)
                 target = best_ob.high + (best_ob.high - best_ob.low) * tp_multiplier
@@ -1109,6 +1244,7 @@ class GoldNDSAnalyzer:
 
             fallback_entry = current_price - (atr_value * 0.3)
             stop = (swing_anchor - atr_value * buffer_mult) if swing_anchor else (current_price - (atr_value * 1.2))
+            self._log_debug("[NDS][ENTRY_IDEA] bullish fallback entry=%.2f stop=%.2f", fallback_entry, stop)
             return finalize_trade(fallback_entry, stop, None, "Fallback bullish idea")
 
         if signal == "SELL":
@@ -1120,6 +1256,13 @@ class GoldNDSAnalyzer:
             ]
             best_fvg = max(target_fvgs, key=lambda x: x.strength) if target_fvgs else None
             if best_fvg:
+                self._log_debug(
+                    "[NDS][ENTRY_IDEA] bearish FVG selected index=%s top=%.2f bottom=%.2f strength=%.2f",
+                    best_fvg.index,
+                    best_fvg.top,
+                    best_fvg.bottom,
+                    best_fvg.strength,
+                )
                 fvg_height = best_fvg.height
                 entry = best_fvg.bottom + (fvg_height * entry_factor)
                 stop = (swing_anchor + atr_value * buffer_mult) if swing_anchor else best_fvg.top + (atr_value * 0.5)
@@ -1129,6 +1272,13 @@ class GoldNDSAnalyzer:
             bearish_obs = [ob for ob in order_blocks if ob.type == 'BEARISH_OB']
             if bearish_obs:
                 best_ob = max(bearish_obs, key=lambda x: x.strength)
+                self._log_debug(
+                    "[NDS][ENTRY_IDEA] bearish OB selected index=%s high=%.2f low=%.2f strength=%.2f",
+                    best_ob.index,
+                    best_ob.high,
+                    best_ob.low,
+                    best_ob.strength,
+                )
                 entry = best_ob.high - (best_ob.high - best_ob.low) * 0.3
                 stop = (swing_anchor + atr_value * buffer_mult) if swing_anchor else best_ob.high + (atr_value * 0.5)
                 target = best_ob.low - (best_ob.high - best_ob.low) * tp_multiplier
@@ -1136,6 +1286,7 @@ class GoldNDSAnalyzer:
 
             fallback_entry = current_price + (atr_value * 0.3)
             stop = (swing_anchor + atr_value * buffer_mult) if swing_anchor else (current_price + (atr_value * 1.2))
+            self._log_debug("[NDS][ENTRY_IDEA] bearish fallback entry=%.2f stop=%.2f", fallback_entry, stop)
             return finalize_trade(fallback_entry, stop, None, "Fallback bearish idea")
 
         return idea
@@ -1218,7 +1369,7 @@ def analyze_gold_market(
     try:
         mode = "Scalping" if scalping_mode else "Regular"
         logger.info(
-            "🔄 Creating Gold Analyzer for %s timeframe %s (%s candles)",
+            "[NDS][INIT] create analyzer mode=%s timeframe=%s candles=%s",
             mode,
             timeframe,
             len(dataframe),
@@ -1230,7 +1381,7 @@ def analyze_gold_market(
         return result
 
     except Exception as e:
-        logger.error("❌ Analysis failed: %s", str(e), exc_info=True)
+        logger.error("[NDS][RESULT] analysis failed: %s", str(e), exc_info=True)
         return AnalysisResult(
             signal="NONE",
             confidence=0.0,
