@@ -61,6 +61,30 @@ class ScalpingRiskManager:
 
         full_config = config.get_full_config()
         return self._merge_with_config(full_config, {})
+
+    @staticmethod
+    def _normalize_gold_specs(gold_specs: Dict[str, Any]) -> Dict[str, Any]:
+        if not gold_specs:
+            return {}
+
+        mapping = {
+            'TICK_VALUE_PER_LOT': 'tick_value_per_lot',
+            'POINT': 'point',
+            'MIN_LOT': 'min_lot',
+            'MAX_LOT': 'max_lot',
+            'LOT_STEP': 'lot_step',
+            'CONTRACT_SIZE': 'contract_size',
+            'DIGITS': 'digits',
+        }
+
+        normalized = dict(gold_specs)
+        for upper_key, lower_key in mapping.items():
+            if lower_key in gold_specs:
+                normalized[lower_key] = gold_specs[lower_key]
+            elif upper_key in gold_specs:
+                normalized[lower_key] = gold_specs[upper_key]
+
+        return normalized
     
     def __init__(self, overrides: Optional[Dict[str, Any]] = None, logger: logging.Logger = None):
         """
@@ -92,61 +116,8 @@ class ScalpingRiskManager:
         # جهت سازگاری با کدهای قدیمی که ممکن است از self.config استفاده کنند
         self.config = self.settings 
 
-        trading_settings = self.settings.get('trading_settings', {}) or {}
-        self.GOLD_SPECS = trading_settings.get('GOLD_SPECIFICATIONS', {}) or {}
-
-
-        # --- Normalize GOLD spec keys (backward compatible) ---
-        specs = dict(self.GOLD_SPECS)  # copy
-
-        # canonical keys expected in code
-        if 'tick_value_per_lot' not in specs:
-            # your config uses TICK_VALUE_PER_LOT
-            if 'TICK_VALUE_PER_LOT' in specs:
-                specs['tick_value_per_lot'] = specs['TICK_VALUE_PER_LOT']
-
-        if 'point' not in specs:
-            if 'POINT' in specs:
-                specs['point'] = specs['POINT']
-
-        if 'min_lot' not in specs:
-            if 'MIN_LOT' in specs:
-                specs['min_lot'] = specs['MIN_LOT']
-
-        if 'max_lot' not in specs:
-            if 'MAX_LOT' in specs:
-                specs['max_lot'] = specs['MAX_LOT']
-
-        if 'lot_step' not in specs:
-            if 'LOT_STEP' in specs:
-                specs['lot_step'] = specs['LOT_STEP']
-
-        if 'contract_size' not in specs:
-            if 'CONTRACT_SIZE' in specs:
-                specs['contract_size'] = specs['CONTRACT_SIZE']
-
-        if 'digits' not in specs:
-            if 'DIGITS' in specs:
-                specs['digits'] = specs['DIGITS']
-
-        # fail fast with explicit message (better than KeyError in the middle of a trade)
-        required = ['tick_value_per_lot', 'point', 'min_lot', 'max_lot', 'lot_step']
-        missing = [k for k in required if k not in specs]
-        if missing:
-            raise KeyError(f"GOLD_SPECIFICATIONS missing required keys: {missing}. موجود: {list(specs.keys())}")
-
-        self.GOLD_SPECS = specs
-
-
-
-
-
-
-
-
-
-
-
+        trading_settings = full_config.get('trading_settings', {})
+        self.GOLD_SPECS = self._normalize_gold_specs(trading_settings.get('GOLD_SPECIFICATIONS', {}))
 
         # ۵. وضعیت ردیابی ریسک اسکلپینگ (بدون تغییر)
         self.daily_risk_used = 0.0
@@ -600,8 +571,8 @@ class ScalpingRiskManager:
 
         market_entry = ask if signal == 'BUY' else bid
         deviation = abs(planned_entry - market_entry)
-        gold_specs = trading_settings.get('GOLD_SPECIFICATIONS', {})
-        point_size = gold_specs.get('POINT')
+        gold_specs = self._normalize_gold_specs(trading_settings.get('GOLD_SPECIFICATIONS', {}))
+        point_size = gold_specs.get('point') or self.GOLD_SPECS.get('point')
         deviation_pips = deviation / point_size if point_size else deviation
 
         order_type = 'MARKET'

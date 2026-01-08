@@ -54,6 +54,8 @@ def run_case(name, risk_manager, config_payload, analysis, live):
     print(f"  deviation_pips={result.deviation_pips}")
     print(f"  reject_reason={result.reject_reason}")
     print(f"  decision_notes={result.decision_notes}")
+    if not result.decision_notes:
+        print("  ⚠️ decision_notes was empty")
     print("-" * 60)
 
 
@@ -71,6 +73,10 @@ def main():
     small_dev_live = LivePriceSnapshot(
         bid=entry - (max_dev * point_size * 0.25),
         ask=entry + (max_dev * point_size * 0.25)
+    )
+    large_dev_live = LivePriceSnapshot(
+        bid=entry - (max_dev * point_size * 2.0),
+        ask=entry + (max_dev * point_size * 2.0)
     )
 
     risk_manager = create_scalping_risk_manager()

@@ -78,32 +78,32 @@ def main():
                 'technical_settings': config_manager.get('technical_settings', {}),
                 'sessions_config': config_manager.get('sessions_config', {}),
                 'trading_rules': config_manager.get('trading_rules', {}),
+                'risk_manager_config': risk_manager_config,
             }
-            
-            # به‌روزرسانی تنظیمات از risk_manager_config
-            scalping_config.update(risk_manager_config)
             
             print("✅ تنظیمات مدیر ریسک اسکلپینگ از config متمرکز بارگیری شد.")
         else:
             print("⚠️ بخش risk_manager_config در config متمرکز یافت نشد. استفاده از تنظیمات پیش‌فرض.")
             scalping_config = {
-                'MAX_RISK_PERCENT': 0.5,
-                'MIN_RISK_PERCENT': 0.05,
-                'MAX_DAILY_RISK_PERCENT': 1.0,
-                'MAX_POSITIONS': 3,
-                'MAX_DAILY_TRADES': 20,
-                'MIN_CONFIDENCE': 65,
-                'HIGH_CONFIDENCE': 85,
-                'MAX_SL_DISTANCE': 10.0,
-                'MIN_SL_DISTANCE': 2.0,
-                'ATR_SL_MULTIPLIER': 1.0,
-                'MIN_RR_RATIO': 1.0,
-                'TARGET_RR_RATIO': 1.2,
-                'MAX_LEVERAGE': 50,
-                'MAX_LOT_SIZE': 2.0,
-                'MIN_RISK_USD': 5.0,
-                'MAX_RISK_USD': 50.0,
-                'POSITION_TIMEOUT_MINUTES': 60,
+                'risk_manager_config': {
+                    'MAX_RISK_PERCENT': 0.5,
+                    'MIN_RISK_PERCENT': 0.05,
+                    'MAX_DAILY_RISK_PERCENT': 1.0,
+                    'MAX_POSITIONS': 3,
+                    'MAX_DAILY_TRADES': 20,
+                    'MIN_CONFIDENCE': 65,
+                    'HIGH_CONFIDENCE': 85,
+                    'MAX_SL_DISTANCE': 10.0,
+                    'MIN_SL_DISTANCE': 2.0,
+                    'ATR_SL_MULTIPLIER': 1.0,
+                    'MIN_RR_RATIO': 1.0,
+                    'TARGET_RR_RATIO': 1.2,
+                    'MAX_LEVERAGE': 50,
+                    'MAX_LOT_SIZE': 2.0,
+                    'MIN_RISK_USD': 5.0,
+                    'MAX_RISK_USD': 50.0,
+                    'POSITION_TIMEOUT_MINUTES': 60,
+                }
             }
 
         # ۴. ایجاد مدیر ریسک اسکلپینگ با تنظیمات یکپارچه
