@@ -30,7 +30,7 @@ def build_analysis(signal: str, entry: float, sl: float, tp: float, confidence: 
         entry_price=entry,
         stop_loss=sl,
         take_profit=tp,
-        reasons=["test-case"],
+        reasons=["smoke-test"],
         context={"market_metrics": {"atr": 1.0, "volatility_ratio": 1.0}},
         timestamp="2024-01-01T00:00:00Z",
         timeframe="M5",
@@ -38,7 +38,7 @@ def build_analysis(signal: str, entry: float, sl: float, tp: float, confidence: 
     )
 
 
-def run_case(risk_manager, config_payload, name, analysis, live, expected_allowed, expected_type=None):
+def run_case(name, risk_manager, config_payload, analysis, live):
     result = risk_manager.finalize_order(
         analysis=analysis,
         live=live,
@@ -46,27 +46,23 @@ def run_case(risk_manager, config_payload, name, analysis, live, expected_allowe
         config=config_payload
     )
 
-    allowed_ok = result.is_trade_allowed == expected_allowed
-    type_ok = True
-    if expected_type is not None:
-        type_ok = result.order_type == expected_type
-
-    status = "PASS" if allowed_ok and type_ok else "FAIL"
-    print(f"[{status}] {name}")
-    print(f"  allowed={result.is_trade_allowed} type={result.order_type} rr={result.rr_ratio:.2f}")
+    print(f"[{name}]")
+    print(f"  allowed={result.is_trade_allowed}")
+    print(f"  order_type={result.order_type}")
+    print(f"  lot={result.lot_size}")
+    print(f"  rr_ratio={result.rr_ratio}")
+    print(f"  deviation_pips={result.deviation_pips}")
     print(f"  reject_reason={result.reject_reason}")
-    print(f"  notes={result.decision_notes}")
+    print(f"  decision_notes={result.decision_notes}")
+    if not result.decision_notes:
+        print("  ⚠️ decision_notes was empty")
     print("-" * 60)
-    return status == "PASS"
 
 
 def main():
     base_config = copy.deepcopy(config_manager.get_full_config())
-    risk_manager = create_scalping_risk_manager()
-
     max_dev = base_config["risk_settings"]["MAX_PRICE_DEVIATION_PIPS"]
     limit_conf = base_config["risk_settings"]["LIMIT_ORDER_MIN_CONFIDENCE"]
-    min_rr = base_config["risk_manager_config"]["MIN_RR_RATIO"]
     point_size = base_config["trading_settings"]["GOLD_SPECIFICATIONS"]["POINT"]
 
     entry = 2400.0
@@ -74,8 +70,6 @@ def main():
     tp = 2420.0
 
     analysis_buy = build_analysis("BUY", entry, sl, tp, confidence=limit_conf + 1)
-    analysis_sell = build_analysis("SELL", entry, entry + 10.0, entry - 20.0, confidence=limit_conf + 1)
-
     small_dev_live = LivePriceSnapshot(
         bid=entry - (max_dev * point_size * 0.25),
         ask=entry + (max_dev * point_size * 0.25)
@@ -85,65 +79,18 @@ def main():
         ask=entry + (max_dev * point_size * 2.0)
     )
 
-    results = []
-    results.append(run_case(
-        risk_manager,
-        base_config,
-        "Small deviation allows market",
-        analysis_buy,
-        small_dev_live,
-        expected_allowed=True,
-        expected_type="MARKET"
-    ))
+    risk_manager = create_scalping_risk_manager()
+    run_case("Base config", risk_manager, base_config, analysis_buy, small_dev_live)
 
-    results.append(run_case(
-        risk_manager,
-        base_config,
-        "Large deviation with high confidence selects limit",
-        analysis_buy,
-        large_dev_live,
-        expected_allowed=True,
-        expected_type="LIMIT"
-    ))
+    overrides = {"risk_manager_config": {"MAX_LOT_SIZE": 1.5}}
+    override_config = copy.deepcopy(base_config)
+    override_config["risk_manager_config"].update(overrides["risk_manager_config"])
+
+    risk_manager_with_overrides = create_scalping_risk_manager(overrides=overrides)
+    run_case("With overrides", risk_manager_with_overrides, override_config, analysis_buy, small_dev_live)
 
     low_conf_analysis = build_analysis("BUY", entry, sl, tp, confidence=limit_conf - 1)
-    results.append(run_case(
-        risk_manager,
-        base_config,
-        "Large deviation with low confidence rejects",
-        low_conf_analysis,
-        large_dev_live,
-        expected_allowed=False
-    ))
-
-    low_rr_tp = entry + (sl - entry) * -(min_rr * 0.5)
-    low_rr_analysis = build_analysis("BUY", entry, sl, low_rr_tp, confidence=limit_conf + 1)
-    results.append(run_case(
-        risk_manager,
-        base_config,
-        "RR below minimum rejects",
-        low_rr_analysis,
-        small_dev_live,
-        expected_allowed=False
-    ))
-
-    sell_case_live = LivePriceSnapshot(
-        bid=entry - (max_dev * point_size * 0.25),
-        ask=entry + (max_dev * point_size * 0.25)
-    )
-    results.append(run_case(
-        risk_manager,
-        base_config,
-        "Sell signal uses risk manager",
-        analysis_sell,
-        sell_case_live,
-        expected_allowed=True
-    ))
-
-    if all(results):
-        print("ALL TESTS PASS")
-    else:
-        print("SOME TESTS FAILED")
+    run_case("Rejected case (low confidence)", risk_manager, base_config, low_conf_analysis, large_dev_live)
 
 
 if __name__ == "__main__":

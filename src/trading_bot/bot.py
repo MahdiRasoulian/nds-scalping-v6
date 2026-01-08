@@ -182,15 +182,17 @@ class NDSBot:
                 }
                 
                 # 5. ایجاد مدیر ریسک (Risk Manager)
-                scalping_config = self.config.get_risk_manager_config()
-                # تزریق تنظیمات فاصله کندلی و انحراف قیمت
-                scalping_config.update({
-                    'MIN_CANDLES_BETWEEN': self.config.get('trading_rules.MIN_CANDLES_BETWEEN'),
-                    'MAX_PRICE_DEVIATION': self.config.get('risk_settings.MAX_PRICE_DEVIATION_PIPS'),
-                    'real_time_enabled': True
-                })
+                scalping_config = {
+                    'risk_manager_config': self.config.get_risk_manager_config(),
+                    'trading_rules': {
+                        'MIN_CANDLES_BETWEEN': self.config.get('trading_rules.MIN_CANDLES_BETWEEN'),
+                    },
+                    'risk_settings': {
+                        'MAX_PRICE_DEVIATION_PIPS': self.config.get('risk_settings.MAX_PRICE_DEVIATION_PIPS'),
+                    },
+                }
                 
-                self.risk_manager = create_scalping_risk_manager(config=scalping_config)
+                self.risk_manager = create_scalping_risk_manager(overrides=scalping_config)
                 
                 logger.info("✅ ربات با موفقیت عملیاتی شد.")
                 
