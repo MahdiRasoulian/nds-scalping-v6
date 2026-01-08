@@ -525,6 +525,21 @@ class GoldNDSAnalyzer:
                 if entry_idea.get("reason"):
                     reasons.append(entry_idea["reason"])
 
+                # --- تغییر کلیدی: اگر Entry Zone نداریم، معامله را کامل کنسل کن ---
+                if entry_price is None or stop_loss is None or take_profit is None:
+                    self._log_info(
+                        "[NDS][ENTRY_IDEA] trade skipped: missing zone (entry=%s stop=%s tp=%s) -> signal NONE",
+                        entry_price,
+                        stop_loss,
+                        take_profit,
+                    )
+                    signal = "NONE"
+                    entry_price = None
+                    stop_loss = None
+                    take_profit = None
+                    reasons.append("Trade skipped: no valid entry zone (FVG/OB) and fallback not allowed.")
+                    result_payload["signal"] = "NONE"
+
             return self._build_analysis_result(
                 signal=signal,
                 confidence=confidence,
@@ -812,7 +827,7 @@ class GoldNDSAnalyzer:
             self._append_reason(
                 reasons,
                 f"{'🟢' if sign > 0 else '🔴'} {ob.type} (Strength: {ob.strength:.1f})",
-            )
+                )
 
         ob_sub = self._bounded(sum(ob_values) / len(ob_values)) if ob_values else 0.0
         breakdown['sub_scores']['order_blocks'] = ob_sub
@@ -1174,6 +1189,39 @@ class GoldNDSAnalyzer:
 
         valid_fvgs = [f for f in fvgs if not f.filled]
 
+        # --- Fallback gating: فقط در ساختار/روند بسیار قوی اجازه fallback ---
+        fallback_min_adx = float(self.GOLD_SETTINGS.get('FALLBACK_MIN_ADX', 30.0))
+        fallback_min_structure = float(self.GOLD_SETTINGS.get('FALLBACK_MIN_STRUCTURE_SCORE', 80.0))
+        normalized_structure_score = self._normalize_structure_score(getattr(structure, 'structure_score', 0.0))
+        trend_value = structure.trend.value if getattr(structure, 'trend', None) else "RANGING"
+        safe_adx = float(adx_value) if adx_value is not None else 0.0
+
+        allow_fallback = (
+            trend_value in {"UPTREND", "DOWNTREND"}
+            and safe_adx >= fallback_min_adx
+            and normalized_structure_score >= fallback_min_structure
+        )
+
+        # لاگ دقیق علت مجاز/غیرمجاز شدن fallback (هم debug و هم info برای visibility)
+        self._log_debug(
+            "[NDS][ENTRY_IDEA][FALLBACK] allow=%s trend=%s adx=%.1f(>=%.1f) structure_score=%.1f(>=%.1f)",
+            allow_fallback,
+            trend_value,
+            safe_adx,
+            fallback_min_adx,
+            normalized_structure_score,
+            fallback_min_structure,
+        )
+        self._log_info(
+            "[NDS][ENTRY_IDEA][FALLBACK] allow=%s trend=%s adx=%.1f structure_score=%.1f thresholds(adx>=%.1f score>=%.1f)",
+            allow_fallback,
+            trend_value,
+            safe_adx,
+            normalized_structure_score,
+            fallback_min_adx,
+            fallback_min_structure,
+        )
+
         def finalize_trade(entry: float, stop: float, target: Optional[float], reason: str) -> Dict[str, Optional[float]]:
             if entry is None or stop is None:
                 return idea
@@ -1205,6 +1253,7 @@ class GoldNDSAnalyzer:
             return idea
 
         swing_anchor = self._select_swing_anchor(structure, signal)
+
         if signal == "BUY":
             target_fvgs = [
                 f for f in valid_fvgs
@@ -1221,10 +1270,11 @@ class GoldNDSAnalyzer:
                     best_fvg.bottom,
                     best_fvg.strength,
                 )
-                fvg_height = best_fvg.height
-                entry = best_fvg.top - (fvg_height * entry_factor)
-                stop = (swing_anchor - atr_value * buffer_mult) if swing_anchor else best_fvg.bottom - (atr_value * 0.5)
-                target = best_fvg.top + (fvg_height * tp_multiplier)
+                # --- تغییر کلیدی: حذف ریسک کرش best_fvg.height ---
+                fvg_height = abs(float(best_fvg.top) - float(best_fvg.bottom))
+                entry = float(best_fvg.top) - (fvg_height * entry_factor)
+                stop = (swing_anchor - atr_value * buffer_mult) if swing_anchor else float(best_fvg.bottom) - (atr_value * 0.5)
+                target = float(best_fvg.top) + (fvg_height * tp_multiplier)
                 return finalize_trade(entry, stop, target, f"Bullish FVG idea (strength: {best_fvg.strength:.1f})")
 
             bullish_obs = [ob for ob in order_blocks if ob.type == 'BULLISH_OB']
@@ -1237,15 +1287,24 @@ class GoldNDSAnalyzer:
                     best_ob.low,
                     best_ob.strength,
                 )
-                entry = best_ob.low + (best_ob.high - best_ob.low) * 0.3
-                stop = (swing_anchor - atr_value * buffer_mult) if swing_anchor else best_ob.low - (atr_value * 0.5)
-                target = best_ob.high + (best_ob.high - best_ob.low) * tp_multiplier
+                entry = float(best_ob.low) + (float(best_ob.high) - float(best_ob.low)) * 0.3
+                stop = (swing_anchor - atr_value * buffer_mult) if swing_anchor else float(best_ob.low) - (atr_value * 0.5)
+                target = float(best_ob.high) + (float(best_ob.high) - float(best_ob.low)) * tp_multiplier
                 return finalize_trade(entry, stop, target, f"Bullish OB idea (strength: {best_ob.strength:.1f})")
+
+            # --- Fallback BUY فقط وقتی allow_fallback=True ---
+            if not allow_fallback:
+                idea["reason"] = (
+                    f"No valid FVG/OB for BUY; fallback disabled "
+                    f"(ADX={safe_adx:.1f}<{fallback_min_adx:.1f} or Structure={normalized_structure_score:.1f}<{fallback_min_structure:.1f} or Trend={trend_value})"
+                )
+                self._log_debug("[NDS][ENTRY_IDEA] bullish fallback blocked reason=%s", idea["reason"])
+                return idea
 
             fallback_entry = current_price - (atr_value * 0.3)
             stop = (swing_anchor - atr_value * buffer_mult) if swing_anchor else (current_price - (atr_value * 1.2))
             self._log_debug("[NDS][ENTRY_IDEA] bullish fallback entry=%.2f stop=%.2f", fallback_entry, stop)
-            return finalize_trade(fallback_entry, stop, None, "Fallback bullish idea")
+            return finalize_trade(fallback_entry, stop, None, "Fallback bullish idea (only allowed in strong structure)")
 
         if signal == "SELL":
             target_fvgs = [
@@ -1263,10 +1322,11 @@ class GoldNDSAnalyzer:
                     best_fvg.bottom,
                     best_fvg.strength,
                 )
-                fvg_height = best_fvg.height
-                entry = best_fvg.bottom + (fvg_height * entry_factor)
-                stop = (swing_anchor + atr_value * buffer_mult) if swing_anchor else best_fvg.top + (atr_value * 0.5)
-                target = best_fvg.bottom - (fvg_height * tp_multiplier)
+                # --- تغییر کلیدی: حذف ریسک کرش best_fvg.height ---
+                fvg_height = abs(float(best_fvg.top) - float(best_fvg.bottom))
+                entry = float(best_fvg.bottom) + (fvg_height * entry_factor)
+                stop = (swing_anchor + atr_value * buffer_mult) if swing_anchor else float(best_fvg.top) + (atr_value * 0.5)
+                target = float(best_fvg.bottom) - (fvg_height * tp_multiplier)
                 return finalize_trade(entry, stop, target, f"Bearish FVG idea (strength: {best_fvg.strength:.1f})")
 
             bearish_obs = [ob for ob in order_blocks if ob.type == 'BEARISH_OB']
@@ -1279,15 +1339,24 @@ class GoldNDSAnalyzer:
                     best_ob.low,
                     best_ob.strength,
                 )
-                entry = best_ob.high - (best_ob.high - best_ob.low) * 0.3
-                stop = (swing_anchor + atr_value * buffer_mult) if swing_anchor else best_ob.high + (atr_value * 0.5)
-                target = best_ob.low - (best_ob.high - best_ob.low) * tp_multiplier
+                entry = float(best_ob.high) - (float(best_ob.high) - float(best_ob.low)) * 0.3
+                stop = (swing_anchor + atr_value * buffer_mult) if swing_anchor else float(best_ob.high) + (atr_value * 0.5)
+                target = float(best_ob.low) - (float(best_ob.high) - float(best_ob.low)) * tp_multiplier
                 return finalize_trade(entry, stop, target, f"Bearish OB idea (strength: {best_ob.strength:.1f})")
+
+            # --- Fallback SELL فقط وقتی allow_fallback=True ---
+            if not allow_fallback:
+                idea["reason"] = (
+                    f"No valid FVG/OB for SELL; fallback disabled "
+                    f"(ADX={safe_adx:.1f}<{fallback_min_adx:.1f} or Structure={normalized_structure_score:.1f}<{fallback_min_structure:.1f} or Trend={trend_value})"
+                )
+                self._log_debug("[NDS][ENTRY_IDEA] bearish fallback blocked reason=%s", idea["reason"])
+                return idea
 
             fallback_entry = current_price + (atr_value * 0.3)
             stop = (swing_anchor + atr_value * buffer_mult) if swing_anchor else (current_price + (atr_value * 1.2))
             self._log_debug("[NDS][ENTRY_IDEA] bearish fallback entry=%.2f stop=%.2f", fallback_entry, stop)
-            return finalize_trade(fallback_entry, stop, None, "Fallback bearish idea")
+            return finalize_trade(fallback_entry, stop, None, "Fallback bearish idea (only allowed in strong structure)")
 
         return idea
 
