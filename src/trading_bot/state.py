@@ -18,12 +18,15 @@ class BotState:
         self.consecutive_losses = 0
         self.daily_pnl = 0.0
         self.active_positions = []
-        self.last_trade_time = None  # زمان آخرین معامله
+        self.last_trade_time = None  # سازگاری با نسخه‌های قدیمی
+        self.last_trade_wall_time = None
+        self.last_trade_candle_time = None
         
     def add_trade(self, success: bool, profit: float = 0.0):
         """ثبت معامله"""
         self.trade_count += 1
         self.last_trade_time = datetime.now()
+        self.last_trade_wall_time = self.last_trade_time
         
         if success:
             self.successful_trades += 1
@@ -52,6 +55,8 @@ class BotState:
             'daily_pnl': self.daily_pnl,
             'consecutive_losses': self.consecutive_losses,
             'active_positions': len(self.active_positions),
-            'last_trade_time': self.last_trade_time.strftime('%H:%M:%S') if self.last_trade_time else 'N/A'
+            'last_trade_time': self.last_trade_time.strftime('%H:%M:%S') if self.last_trade_time else 'N/A',
+            'last_trade_wall_time': self.last_trade_wall_time.strftime('%H:%M:%S') if self.last_trade_wall_time else 'N/A',
+            'last_trade_candle_time': self.last_trade_candle_time.strftime('%H:%M:%S') if self.last_trade_candle_time else 'N/A',
         }
         return stats

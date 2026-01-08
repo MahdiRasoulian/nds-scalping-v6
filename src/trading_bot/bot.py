@@ -47,6 +47,7 @@ except ImportError as e:
 
 from src.trading_bot.state import BotState
 from src.trading_bot.execution_reporting import generate_execution_report
+from src.trading_bot.contracts import ExecutionEvent, PositionContract, compute_pips
 from src.trading_bot.nds.models import LivePriceSnapshot
 from src.trading_bot.realtime_price import RealTimePriceMonitor
 from src.trading_bot.trade_tracker import TradeTracker
@@ -337,8 +338,8 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
             logger.info(f"✅ {len(df)} کندل دریافت شد | قیمت جاری: ${df['close'].iloc[-1]:.2f}")
 
             # --- استراحت کندلی (استاندارد: زمان کندل) ---
-            if self.bot_state.last_trade_time and not df.empty:
-                last_trade_time = self.bot_state.last_trade_time
+            if self.bot_state.last_trade_candle_time and not df.empty:
+                last_trade_time = self.bot_state.last_trade_candle_time
                 candles_passed = len(df[df["time"] > last_trade_time])
                 if candles_passed < MIN_CANDLES_BETWEEN:
                     wait_needed = MIN_CANDLES_BETWEEN - candles_passed
@@ -403,8 +404,10 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
                     trade_success = self.execute_scalping_trade(result, df)
                     if trade_success:
                         # ✅ زمان معامله بر اساس زمان کندل (برای محاسبه candles_passed)
-                        self.bot_state.last_trade_time = df["time"].iloc[-1]
-                        logger.info(f"✅ معامله در زمان کندل {self.bot_state.last_trade_time} ثبت شد")
+                        self.bot_state.last_trade_candle_time = df["time"].iloc[-1]
+                        self.bot_state.last_trade_wall_time = datetime.now()
+                        self.bot_state.last_trade_time = self.bot_state.last_trade_wall_time
+                        logger.info(f"✅ معامله در زمان کندل {self.bot_state.last_trade_candle_time} ثبت شد")
                         # مانیتورینگ فوری بعد از ارسال سفارش
                         self._maybe_monitor_trades(force=True)
                 else:
@@ -436,49 +439,31 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
             logger.error(f"⚠️ خطا در دریافت تعداد پوزیشن‌های باز: {e}", exc_info=True)
             return 0
 
-    def get_open_positions_info(self) -> List[Dict[str, Any]]:
+    def get_open_positions_info(self) -> List[PositionContract]:
         """
         دریافت اطلاعات دقیق پوزیشن‌های باز
         سازگار با mt5_client.get_open_positions که لیست dict برمی‌گرداند
         """
         SYMBOL = self.config.get("trading_settings.SYMBOL")
         try:
-            positions = self.mt5_client.get_open_positions(symbol=SYMBOL)
+            positions: List[PositionContract] = self.mt5_client.get_open_positions(symbol=SYMBOL)
             if not positions:
                 logger.debug(f"No open positions information available for {SYMBOL}")
                 return []
 
-            positions_info: List[Dict[str, Any]] = []
             for pos in positions:
-                # pos در MT5Client یک dict است
-                try:
-                    pos_info = {
-                        "ticket": pos.get("ticket"),
-                        "symbol": pos.get("symbol", ""),
-                        "type": pos.get("type"),  # 'BUY'/'SELL'
-                        "volume": float(pos.get("volume", 0.0) or 0.0),
-                        "entry_price": float(pos.get("entry_price", 0.0) or 0.0),
-                        "current_price": float(pos.get("current_price", 0.0) or 0.0),
-                        "sl": float(pos.get("sl", 0.0) or 0.0),
-                        "tp": float(pos.get("tp", 0.0) or 0.0),
-                        "profit": float(pos.get("profit", 0.0) or 0.0),
-                        "time": pos.get("time"),
-                        "time_update": pos.get("time_update"),
-                        "comment": pos.get("comment", ""),
-                        "magic": pos.get("magic"),
-                    }
+                logger.debug(
+                    "Position #%s: %s %.3f @ $%.2f | cur=$%.2f | pnl=$%.2f",
+                    pos["position_ticket"],
+                    pos["side"],
+                    pos["volume"],
+                    pos["entry_price"],
+                    pos["current_price"],
+                    pos["profit"],
+                )
 
-                    if pos_info["symbol"] == SYMBOL or not SYMBOL:
-                        positions_info.append(pos_info)
-                        logger.debug(
-                            f"Position #{pos_info['ticket']}: {pos_info['type']} {pos_info['volume']} "
-                            f"@ ${pos_info['entry_price']:.2f} | cur=${pos_info['current_price']:.2f} | pnl=${pos_info['profit']:.2f}"
-                        )
-                except Exception as inner_e:
-                    logger.warning(f"Could not parse individual position: {inner_e}", exc_info=True)
-
-            logger.info(f"Retrieved {len(positions_info)} open positions for {SYMBOL}")
-            return positions_info
+            logger.info(f"Retrieved {len(positions)} open positions for {SYMBOL}")
+            return positions
 
         except Exception as e:
             logger.error(f"⚠️ خطا در دریافت اطلاعات پوزیشن‌ها: {e}", exc_info=True)
@@ -781,13 +766,15 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
             # ارزیابی نتیجه
             success = False
             order_id = None
+            position_ticket = None
             actual_entry_price = finalized.entry_price
             actual_sl = finalized.stop_loss
             actual_tp = finalized.take_profit
 
             if isinstance(order_result, dict):
                 success = bool(order_result.get("success"))
-                order_id = order_result.get("ticket")
+                order_id = order_result.get("order_ticket") or order_result.get("ticket")
+                position_ticket = order_result.get("position_ticket")
                 # در send_order_real_time مقادیر entry/sl/tp برمی‌گردند
                 actual_entry_price = float(order_result.get("entry_price", actual_entry_price) or actual_entry_price)
                 actual_sl = float(order_result.get("stop_loss", actual_sl) or actual_sl)
@@ -798,9 +785,12 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
                 order_id = order_result
 
             if success and order_id:
+                signal_data["order_ticket"] = order_id
+                signal_data["position_ticket"] = position_ticket
                 logger.info(
-                    "✅ [TRADE][OPEN] ticket=%s symbol=%s side=%s entry=%.2f sl=%.2f tp=%.2f vol=%.3f order_type=%s",
+                    "✅ [TRADE][OPEN] ticket=%s position=%s symbol=%s side=%s entry=%.2f sl=%.2f tp=%.2f vol=%.3f order_type=%s",
                     order_id,
+                    position_ticket,
                     SYMBOL,
                     signal_data["signal"],
                     actual_entry_price,
@@ -811,32 +801,46 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
                 )
                 print(f"✅ سفارش {order_type} ارسال شد - ticket={order_id} | حجم: {lot_size:.3f} لات")
 
-                # ثبت در ترید ترکر
-                self.trade_tracker.add_trade(
-                    order_id,
-                    {
-                        "entry_price": actual_entry_price,
-                        "stop_loss": actual_sl,
-                        "take_profit": actual_tp,
-                        "volume": lot_size,
-                        "symbol": SYMBOL,
-                        "signal_type": signal_data["signal"],  # ✅ کلید استاندارد
+                open_event: ExecutionEvent = {
+                    "event_type": "OPEN",
+                    "event_time": datetime.now(),
+                    "symbol": SYMBOL,
+                    "order_ticket": order_id,
+                    "position_ticket": position_ticket,
+                    "side": signal_data["signal"],
+                    "volume": lot_size,
+                    "entry_price": actual_entry_price,
+                    "exit_price": None,
+                    "sl": actual_sl,
+                    "tp": actual_tp,
+                    "profit": None,
+                    "pips": None,
+                    "reason": None,
+                    "metadata": {
                         "confidence": signal_data.get("confidence", 0),
                         "scalping_grade": scalping_grade,
                         "timeframe": TIMEFRAME,
                         "risk_amount": getattr(finalized, "risk_amount_usd", None),
                         "session": current_session,
                         "order_type": order_type,
-                        "created_at": datetime.now(),
+                        "magic": getattr(finalized, "magic", None),
+                        "comment": order_result.get("comment") if isinstance(order_result, dict) else None,
+                        "price_deviation_pips": price_deviation_pips,
+                        "market_metrics": market_metrics,
+                        "decision_notes": finalized.decision_notes,
+                        "analysis_snapshot": signal_data,
+                        "rr_ratio": getattr(finalized, "rr_ratio", None),
                     },
-                )
+                }
+                self.trade_tracker.add_trade_open(open_event)
 
                 self.bot_state.add_trade(success=True)
 
                 # برای candle-based cooldown، اینجا datetime.now نگذار (در run_analysis_cycle set می‌شود)
                 # اگر df نبود، حداقل local زمان را بگذار
                 if df is None or df.empty:
-                    self.bot_state.last_trade_time = datetime.now()
+                    self.bot_state.last_trade_wall_time = datetime.now()
+                    self.bot_state.last_trade_time = self.bot_state.last_trade_wall_time
 
                 # آپدیت ریسک منیجر
                 if hasattr(self.risk_manager, "add_position"):
@@ -845,19 +849,7 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
                 # گزارش اجرا
                 generate_execution_report(
                     logger=logger,
-                    signal_data=signal_data,
-                    finalized=finalized,
-                    order_id=order_id,
-                    symbol=SYMBOL,
-                    timeframe=TIMEFRAME,
-                    order_type=order_type,
-                    lot_size=lot_size,
-                    current_session=current_session,
-                    scalping_grade=scalping_grade,
-                    market_metrics=market_metrics,
-                    current_price_data=current_price_data,
-                    price_deviation_pips=price_deviation_pips,
-                    risk_manager=self.risk_manager,
+                    event=open_event,
                     df=df,
                 )
 
@@ -899,106 +891,75 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
         if not hasattr(self, "trade_tracker"):
             return
 
-        # اگر هیچ trade فعالی نداریم، علاوه بر active_trades_count،
-        # ممکن است trade_tracker ساختار متفاوتی داشته باشد؛ محافظه‌کارانه:
         try:
-            active_count = self.trade_tracker.get_active_trades_count()
-        except Exception:
-            active_count = len(getattr(self.trade_tracker, "active_trades", {}) or {})
-
-        if active_count == 0:
-            return
-
-        try:
+            SYMBOL = self.config.get("trading_settings.SYMBOL")
             open_positions = self.get_open_positions_info()
-            mt5_pos_map = {p["ticket"]: p for p in open_positions if p.get("ticket") is not None}
+            added_count, updated_count, closed_candidates = self.trade_tracker.reconcile_with_open_positions(open_positions)
 
-            pending_orders = self.get_pending_orders_info()
-            mt5_pending_map = {o.get("ticket"): o for o in pending_orders if o.get("ticket") is not None}
+            if added_count or updated_count:
+                logger.debug("🔄 Trade reconciliation: added=%s updated=%s", added_count, updated_count)
 
-            active_tickets = list((getattr(self.trade_tracker, "active_trades", {}) or {}).keys())
-
-            for ticket in active_tickets:
-                # 1) اگر پوزیشن باز است: update
-                if ticket in mt5_pos_map:
-                    pos = mt5_pos_map[ticket]
-                    cur_price = float(pos.get("current_price", 0.0) or 0.0)
-                    cur_profit = float(pos.get("profit", 0.0) or 0.0)
-
-                    try:
-                        self.trade_tracker.update_trade(
-                            ticket=ticket,
-                            current_price=cur_price,
-                            current_profit=cur_profit,
-                            mt5_client=self.mt5_client,
-                        )
-                    except TypeError:
-                        # اگر امضای update_trade متفاوت باشد:
-                        self.trade_tracker.update_trade(ticket, cur_price, cur_profit, self.mt5_client)
-
-                    logger.debug("[TRADE][UPDATE] ticket=%s price=%.2f profit=%.2f", ticket, cur_price, cur_profit)
+            for record in closed_candidates:
+                identity = record.get("trade_identity", {})
+                position_ticket = identity.get("position_ticket")
+                if not position_ticket:
                     continue
 
-                # 2) اگر پوزیشن نیست ولی pending هست: هنوز بسته نشده
-                if ticket in mt5_pending_map:
-                    # اختیاری: می‌توان وضعیت pending را هم لاگ کرد
-                    logger.debug("[TRADE][PENDING] ticket=%s still pending in MT5", ticket)
+                history = self.mt5_client.get_position_history(position_ticket)
+                if not history or not history.get("close_time"):
+                    self.trade_tracker.mark_trade_unknown(position_ticket, "history_not_found")
+                    logger.debug("⏳ Close not confirmed for position %s. Will retry.", position_ticket)
                     continue
 
-                # 3) نه پوزیشن است نه pending: بسته/حذف شده است
-                trade_info = (getattr(self.trade_tracker, "active_trades", {}) or {}).get(ticket, {}) or {}
+                symbol = identity.get("symbol") or SYMBOL
+                side = record.get("open_event", {}).get("side")
+                entry_price = record.get("open_event", {}).get("entry_price")
+                exit_price = history.get("exit_price") or record.get("last_update_event", {}).get("metadata", {}).get("current_price")
+                profit = history.get("total_profit")
+                close_time = history.get("close_time")
+                reason = history.get("reason")
 
-                # snapshot قبل از close/update نهایی
-                symbol = trade_info.get("symbol", self.config.get("trading_settings.SYMBOL") or "XAUUSD!")
-                signal_type = trade_info.get("signal_type", trade_info.get("type", "Unknown"))
-                entry_p = float(trade_info.get("entry_price", 0.0) or 0.0)
+                pips_val = compute_pips(symbol, entry_price or 0.0, exit_price or 0.0)
 
-                # اگر tracker قبلاً current_price/profit داشته، همان را استفاده کن
-                exit_p = float(trade_info.get("current_price", 0.0) or 0.0)
-                final_profit = float(trade_info.get("current_profit", 0.0) or 0.0)
+                close_event: ExecutionEvent = {
+                    "event_type": "CLOSE",
+                    "event_time": close_time or datetime.now(),
+                    "symbol": symbol,
+                    "order_ticket": identity.get("order_ticket"),
+                    "position_ticket": position_ticket,
+                    "side": side,
+                    "volume": record.get("open_event", {}).get("volume"),
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "sl": record.get("open_event", {}).get("sl"),
+                    "tp": record.get("open_event", {}).get("tp"),
+                    "profit": profit,
+                    "pips": pips_val,
+                    "reason": reason,
+                    "metadata": {"history": history},
+                }
 
-                # اگر exit_p صفر است، از tick لحظه‌ای کمک بگیر
-                if exit_p <= 0:
-                    try:
-                        tick = self.mt5_client.get_current_tick(symbol) if hasattr(self.mt5_client, "get_current_tick") else None
-                        if tick:
-                            # برای BUY خروج با bid، برای SELL خروج با ask (تقریبی)
-                            if str(signal_type).upper() == "BUY":
-                                exit_p = float(tick.get("bid", 0.0) or 0.0)
-                            else:
-                                exit_p = float(tick.get("ask", 0.0) or 0.0)
-                    except Exception:
-                        pass
+                self.trade_tracker.close_trade_event(close_event)
+                generate_execution_report(logger=logger, event=close_event)
 
-                # محاسبه pip (طلا: 0.10 = 1 pip => ضربدر 10 روی اختلاف قیمت)
-                pips_val = 0.0
-                if entry_p > 0 and exit_p > 0:
-                    pips_val = abs(exit_p - entry_p) * 10.0
+                logger.info(
+                    "[TRADE][CLOSE] position=%s profit=%.2f pips=%.1f reason=%s",
+                    position_ticket,
+                    float(profit or 0.0),
+                    float(pips_val or 0.0),
+                    reason,
+                )
 
-                # بستن/نهایی‌سازی در tracker
-                try:
-                    self.trade_tracker.update_trade(
-                        ticket=ticket,
-                        current_price=exit_p,
-                        current_profit=final_profit,
-                        mt5_client=self.mt5_client,
-                    )
-                except TypeError:
-                    self.trade_tracker.update_trade(ticket, exit_p, final_profit, self.mt5_client)
-
-                logger.info("[TRADE][CLOSE] ticket=%s profit=%.2f pips=%.1f reason=%s", ticket, final_profit, pips_val, "TP/SL or Manual Close")
-
-                # تلگرام
                 if hasattr(self, "notifier") and self.notifier is not None:
                     try:
                         self.notifier.send_trade_close_notification(
                             symbol=symbol,
-                            signal_type=signal_type,
-                            profit_usd=final_profit,
-                            pips=pips_val,
-                            reason="🎯 TP/SL or Manual Close",
+                            signal_type=side or "Unknown",
+                            profit_usd=float(profit or 0.0),
+                            pips=float(pips_val or 0.0),
+                            reason=reason or "Manual/Other",
                         )
-                        logger.info(f"✅ گزارش تلگرام برای بسته‌شدن پوزیشن #{ticket} ارسال شد.")
+                        logger.info(f"✅ گزارش تلگرام برای بسته‌شدن پوزیشن #{position_ticket} ارسال شد.")
                     except Exception as tel_err:
                         logger.error(f"⚠️ خطا در ارسال نوتیفیکیشن تلگرام: {tel_err}", exc_info=True)
 
