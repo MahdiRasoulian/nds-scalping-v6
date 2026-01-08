@@ -7,7 +7,7 @@ from .analyzer import GoldNDSAnalyzer, analyze_gold_market
 from .models import (
     SwingPoint, SwingType, FVG, FVGType, OrderBlock, 
     LiquiditySweep, MarketStructure, MarketTrend, 
-    MarketState, SignalType, EntryParameters,
+    MarketState, SignalType,
     SessionAnalysis, VolumeAnalysis, MarketMetrics
 )
 from .constants import (
@@ -22,7 +22,7 @@ __all__ = [
     # Models
     'SwingPoint', 'SwingType', 'FVG', 'FVGType', 'OrderBlock',
     'LiquiditySweep', 'MarketStructure', 'MarketTrend', 
-    'MarketState', 'SignalType', 'EntryParameters',
+    'MarketState', 'SignalType',
     'SessionAnalysis', 'VolumeAnalysis', 'MarketMetrics',
     # Constants
     'ANALYSIS_CONFIG_KEYS', 'SESSION_MAPPING'
