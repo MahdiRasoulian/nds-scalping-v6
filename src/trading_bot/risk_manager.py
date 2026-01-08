@@ -61,6 +61,30 @@ class ScalpingRiskManager:
 
         full_config = config.get_full_config()
         return self._merge_with_config(full_config, {})
+
+    @staticmethod
+    def _normalize_gold_specs(gold_specs: Dict[str, Any]) -> Dict[str, Any]:
+        if not gold_specs:
+            return {}
+
+        mapping = {
+            'TICK_VALUE_PER_LOT': 'tick_value_per_lot',
+            'POINT': 'point',
+            'MIN_LOT': 'min_lot',
+            'MAX_LOT': 'max_lot',
+            'LOT_STEP': 'lot_step',
+            'CONTRACT_SIZE': 'contract_size',
+            'DIGITS': 'digits',
+        }
+
+        normalized = dict(gold_specs)
+        for upper_key, lower_key in mapping.items():
+            if lower_key in gold_specs:
+                normalized[lower_key] = gold_specs[lower_key]
+            elif upper_key in gold_specs:
+                normalized[lower_key] = gold_specs[upper_key]
+
+        return normalized
     
     def __init__(self, overrides: Optional[Dict[str, Any]] = None, logger: logging.Logger = None):
         """
@@ -93,7 +117,7 @@ class ScalpingRiskManager:
         self.config = self.settings 
 
         trading_settings = full_config.get('trading_settings', {})
-        self.GOLD_SPECS = trading_settings.get('GOLD_SPECIFICATIONS', {})
+        self.GOLD_SPECS = self._normalize_gold_specs(trading_settings.get('GOLD_SPECIFICATIONS', {}))
 
         # ۵. وضعیت ردیابی ریسک اسکلپینگ (بدون تغییر)
         self.daily_risk_used = 0.0
@@ -547,8 +571,8 @@ class ScalpingRiskManager:
 
         market_entry = ask if signal == 'BUY' else bid
         deviation = abs(planned_entry - market_entry)
-        gold_specs = trading_settings.get('GOLD_SPECIFICATIONS', {})
-        point_size = gold_specs.get('POINT')
+        gold_specs = self._normalize_gold_specs(trading_settings.get('GOLD_SPECIFICATIONS', {}))
+        point_size = gold_specs.get('point') or self.GOLD_SPECS.get('point')
         deviation_pips = deviation / point_size if point_size else deviation
 
         order_type = 'MARKET'
