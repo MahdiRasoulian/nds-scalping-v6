@@ -504,7 +504,12 @@ class GoldNDSAnalyzer:
         if raw_score is None:
             return 0.0
         score = float(raw_score)
-        return max(0.0, min(100.0, score))
+        if score <= 1.5:
+            score *= 100
+        elif score <= 10:
+            score *= 10
+        score = max(0.0, min(100.0, score))
+        return score
 
     def _bounded(self, value: float, minimum: float = -1.0, maximum: float = 1.0) -> float:
         return max(minimum, min(maximum, value))
@@ -619,10 +624,10 @@ class GoldNDSAnalyzer:
             bos_component = -1.0
             reasons.append("🔻 Bearish BOS")
 
-        if structure.choch == "BULLISH_CHOCH":
+        if structure.choch == "BULLISH_CHoCH":
             choch_component = 1.0
             reasons.append("✅ Bullish CHoCH")
-        elif structure.choch == "BEARISH_CHOCH":
+        elif structure.choch == "BEARISH_CHoCH":
             choch_component = -1.0
             reasons.append("🔻 Bearish CHoCH")
 
