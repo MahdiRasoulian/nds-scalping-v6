@@ -15,6 +15,12 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from collections import deque
+_SCORE_HIST = deque(maxlen=400)
+
+import math
+from statistics import mean, pstdev
+
 import pandas as pd
 
 from .constants import (
@@ -57,6 +63,7 @@ class GoldNDSAnalyzer:
         self._validate_dataframe()
         self.timeframe = self._detect_timeframe()
         self._apply_timeframe_settings()
+
 
         self._log_info(
             "[NDS][INIT] initialized candles=%s timeframe=%s",
@@ -1020,6 +1027,35 @@ class GoldNDSAnalyzer:
 
         return score, reasons, breakdown
 
+
+
+
+    def _sigmoid(self, x: float) -> float:
+        if x >= 0:
+            z = math.exp(-x)
+            return 1.0 / (1.0 + z)
+        z = math.exp(x)
+        return z / (1.0 + z)
+
+    def _clamp(self, lo: float, x: float, hi: float) -> float:
+        return max(lo, min(x, hi))
+
+    def _safe_mult(self, m: float) -> float:
+        try:
+            m = float(m)
+        except Exception:
+            m = 1.0
+        return self._clamp(0.05, m, 1.5)
+
+    def _soft_floor_rational(self, conf_pen: float, floor: float, cap: float, t: float) -> float:
+        try:
+            conf_pen = float(conf_pen)
+        except Exception:
+            conf_pen = 0.0
+        conf_pen = max(0.0, conf_pen)
+        return floor + (cap - floor) * (conf_pen / (conf_pen + t))
+
+
     def _calculate_confidence(
         self,
         normalized_score: float,
@@ -1029,55 +1065,73 @@ class GoldNDSAnalyzer:
         scalping_mode: bool = True,
         sweeps: Optional[list] = None,
     ) -> float:
-        """محاسبه اعتماد سیگنال
-
-        نکته عملیاتی:
-        - این تابع باید کاملاً قابل ردیابی (traceable) باشد تا هر ناسازگاری بین SCORE و CONFIDENCE
-        در لاگ‌ها سریعاً قابل کشف باشد.
-
-        سیاست جدید:
-        - session_weight و activity فقط کیفیت هستند.
-        - inactive penalty (×0.8) فقط برای untradable واقعی اعمال می‌شود.
         """
-        # --- Base from score distance to neutral (50) ---
-        base_confidence = abs(normalized_score - 50) * 2.4
+        Design 3 (Z-score probability-of-edge) + log-space penalties + soft-floor
+        - بدون hard clamp کف 10
+        - پنالتی near-neutral به شکل پیوسته (جایگزین 42..58)
+        - traceable logs
+        """
 
-        # --- Volatility adjustment ---
+        score = float(normalized_score)
+
+        # ------------------------------
+        # Parameters (TUNE)
+        # ------------------------------
+        C_MIN = 2.0
+        C_MAX = 85.0
+
+        # z-edge mapping
+        Z0 = 0.9       # زیر 1σ: edge ضعیف
+        KZ = 0.45       # شیب sigmoid برای z
+
+        # neutral softness (جایگزین if 42..58)
+        D0 = 4.5        # آستانه فاصله از 50
+        KD = 2.0        # شیب
+        NEUTRAL_FLOOR = 0.55  # کف جریمه نزدیک 50 (نه 0.5 تهاجمی)
+
+        # penalty strengths
+        ALPHA_SESSION = 0.70
+        ALPHA_RVOL = 0.55
+        ALPHA_NEUTRAL = 0.75
+        ALPHA_VOL = 0.40      # اثر volatility را هم نرم کنید
+
+        # soft-floor shaping
+        FLOOR = 2.0
+        T = 18.0
+
+        # ------------------------------
+        # Volatility adjustment (soft)
+        # ------------------------------
         volatility_state = self._normalize_volatility_state(volatility_state)
         vol_mult = 1.0
         if volatility_state == 'HIGH_VOLATILITY':
-            vol_mult = 1.1 if scalping_mode else 0.8
+            vol_mult = 1.08 if scalping_mode else 0.85
         elif volatility_state == 'LOW_VOLATILITY':
-            vol_mult = 0.9 if scalping_mode else 1.05
-        base_confidence *= vol_mult
+            vol_mult = 0.92 if scalping_mode else 1.05
+        vol_mult_s = self._safe_mult(vol_mult)
 
-        # --- Session adjustment ---
-        session_mult = 1.0
+        # ------------------------------
+        # Session multiplier (same policy, but we will apply softly)
+        # ------------------------------
         session_name = str(getattr(session_analysis, "current_session", "UNKNOWN") or "UNKNOWN")
         session_weight = float(getattr(session_analysis, "session_weight", 1.0) or 1.0)
 
-        # upstream flag (بعد از اصلاح upstream باید معنی درست داشته باشد)
         upstream_active = bool(getattr(session_analysis, "is_active_session", True))
-
-        # activity (کیفیت)
         session_activity = str(
-            getattr(session_analysis, "session_activity",
-                    getattr(session_analysis, "activity", "UNKNOWN"))
-            or "UNKNOWN"
+            getattr(session_analysis, "session_activity", getattr(session_analysis, "activity", "UNKNOWN")) or "UNKNOWN"
         ).upper()
 
-        # strong_signal guard
-        strong_signal = abs(normalized_score - 50) > 15
+        strong_signal = abs(score - 50) > 15
 
-        # 1) Quality penalties/bonuses
+        session_mult = 1.0
         if session_weight < 0.6:
             session_mult *= 0.75
-
         if strong_signal and session_weight > 0.8:
             session_mult *= 1.15
 
-        # 2) Determine "effective_active" (فقط untradable خاموش می‌کند)
-        # untradable signals are optional and may not exist
+        # ------------------------------
+        # Untradable gate (unchanged)
+        # ------------------------------
         market_status = str(volume_analysis.get("market_status", "") or "").upper()
         data_ok = volume_analysis.get("data_ok", None)
         spread = volume_analysis.get("spread", None)
@@ -1102,18 +1156,18 @@ class GoldNDSAnalyzer:
             except Exception:
                 pass
 
-        # effective_active: اگر upstream false بود ولی هیچ untradable نداریم، override به true
         effective_active = upstream_active
         if (not upstream_active) and (not untradable):
             effective_active = True
 
-        # inactive penalty فقط برای untradable واقعی
         if not effective_active:
             session_mult *= 0.8
 
-        base_confidence *= session_mult
+        session_mult_s = self._safe_mult(session_mult)
 
-        # --- RVOL adjustment ---
+        # ------------------------------
+        # RVOL multiplier (same idea but soft)
+        # ------------------------------
         rvol_mult = 1.0
         current_rvol = volume_analysis.get('rvol', 1.0)
         try:
@@ -1125,58 +1179,111 @@ class GoldNDSAnalyzer:
             rvol_mult *= 1.1
         elif current_rvol < 0.8:
             rvol_mult *= 0.9
-        base_confidence *= rvol_mult
 
-        # --- Sweep bonus (contextual) ---
-        sweep_mult = 1.0
+        rvol_mult_s = self._safe_mult(rvol_mult)
+
+        # ------------------------------
+        # Neutral softness (score نزدیک 50 را نرم penalize کن)
+        # replaces hard if 42..58 => 0.5
+        # ------------------------------
+        d = abs(score - 50.0)
+        neutral_mult = NEUTRAL_FLOOR + (1.0 - NEUTRAL_FLOOR) * self._sigmoid((d - D0) / KD)
+        neutral_mult_s = self._safe_mult(neutral_mult)
+
+        # ------------------------------
+        # Z-score history (probability of edge)
+        # ------------------------------
+        hist = list(_SCORE_HIST)
+
+        # اگر history نداریم، fall back به یک mapping ساده روی |score-50|
+        # (تا راه بیفتد و بعد با history دقیق شود)
+        if len(hist) >= 30:
+            mu = mean(hist)
+            sigma = pstdev(hist)  # std
+            sigma = max(1.0, float(sigma))  # کف برای جلوگیری از z انفجاری
+            z = (score - float(mu)) / sigma
+            z_edge = abs(z)
+            p_edge = self._sigmoid((z_edge - Z0) / KZ)
+            conf_raw = C_MIN + (C_MAX - C_MIN) * p_edge
+            z_mode = f"hist(n={len(hist)})"
+        else:
+            # fallback: هنوز history کافی نیست
+            # این را طوری می‌گذاریم که نزدیک 50 پایین باشد و بعداً history جایگزین شود
+            p_edge = self._sigmoid((d - 6.0) / 2.5)  # دقت کمتر، فقط برای warmup
+            conf_raw = C_MIN + (C_MAX - C_MIN) * p_edge
+            mu = 50.0
+            sigma = 0.0
+            z = 0.0
+            z_edge = 0.0
+            z_mode = f"warmup(n={len(hist)})"
+
+        # ------------------------------
+        # Apply penalties in exponent/log-space (equivalent)
+        # ------------------------------
+        vol_eff = vol_mult_s ** ALPHA_VOL
+        session_eff = session_mult_s ** ALPHA_SESSION
+        rvol_eff = rvol_mult_s ** ALPHA_RVOL
+        neutral_eff = neutral_mult_s ** ALPHA_NEUTRAL
+
+        combined_eff = vol_eff * session_eff * rvol_eff * neutral_eff
+        conf_pen = conf_raw * combined_eff
+
+        # ------------------------------
+        # Sweep bonus (اگر واقعاً لازم دارید: خیلی نرم)
+        # ------------------------------
         sweeps_count = len(sweeps) if sweeps else 0
+        sweep_mult = 1.0
         if sweeps_count > 0 and strong_signal:
-            sweep_mult *= 1.05
-            base_confidence *= sweep_mult
+            sweep_mult = 1.03
+            conf_pen *= sweep_mult
 
-        # --- Range compression penalty (if near-neutral) ---
-        range_penalty_mult = 1.0
-        if 42 <= normalized_score <= 58:
-            range_penalty_mult = 0.5
-            base_confidence *= range_penalty_mult
+        # ------------------------------
+        # Soft-floor final (no hard clamp to 10)
+        # ------------------------------
+        conf_final = self._soft_floor_rational(conf_pen, floor=FLOOR, cap=C_MAX, t=T)
+        conf_final = self._clamp(0.0, conf_final, 100.0)
 
-        # --- Clamp ---
-        confidence = min(95, base_confidence * 1.1)
-        confidence = max(10, confidence)
+        # ------------------------------
+        # Update history AFTER computation (avoid leakage)
+        # ------------------------------
+        try:
+            _SCORE_HIST.append(score)
+        except Exception:
+            pass
 
-        # --- Instrumentation (single-line, deterministic, parse-friendly) ---
+        # ------------------------------
+        # Logging (auditable, parse-friendly)
+        # ------------------------------
         try:
             reasons_str = ",".join(untradable_reasons) if untradable_reasons else "-"
             self._log_info(
-                "[NDS][CONF] score=%.2f base=%.2f vol=%s vol_mult=%.3f "
-                "session=%s weight=%.2f activity=%s upstream_active=%s effective_active=%s untradable=%s reasons=%s strong=%s session_mult=%.3f "
-                "rvol=%.2f rvol_mult=%.3f sweeps=%d sweep_mult=%.3f "
-                "range_mult=%.3f -> conf=%.2f",
-                float(normalized_score),
-                float(abs(normalized_score - 50) * 2.4),
-                volatility_state,
-                float(vol_mult),
-                session_name,
-                float(session_weight),
-                session_activity,
-                bool(upstream_active),
-                bool(effective_active),
-                bool(untradable),
-                reasons_str,
-                bool(strong_signal),
-                float(session_mult),
-                float(current_rvol),
-                float(rvol_mult),
-                int(sweeps_count),
-                float(sweep_mult),
-                float(range_penalty_mult),
-                float(confidence),
+                "[NDS][CONF_V2] score=%.2f d=%.2f vol=%s vol_mult=%.3f vol_eff=%.3f(a=%.2f) | "
+                "sess=%s w=%.2f act=%s upstream=%s eff_active=%s untradable=%s reasons=%s strong=%s "
+                "session_mult=%.3f session_eff=%.3f(a=%.2f) | "
+                "rvol=%.2f rvol_mult=%.3f rvol_eff=%.3f(a=%.2f) | "
+                "neutral_mult=%.3f neutral_eff=%.3f(a=%.2f) | "
+                "z_mode=%s mu=%.2f sigma=%.2f z=%.3f z_edge=%.3f p_edge=%.4f conf_raw=%.2f | "
+                "combined_eff=%.4f sweeps=%d sweep_mult=%.3f conf_pen=%.2f | "
+                "soft_floor(f=%.1f,t=%.1f,cap=%.1f)->conf=%.2f",
+                score, d,
+                volatility_state, vol_mult_s, vol_eff, ALPHA_VOL,
+                session_name, session_weight, session_activity,
+                bool(upstream_active), bool(effective_active),
+                bool(untradable), reasons_str, bool(strong_signal),
+                session_mult_s, session_eff, ALPHA_SESSION,
+                float(current_rvol), rvol_mult_s, rvol_eff, ALPHA_RVOL,
+                neutral_mult_s, neutral_eff, ALPHA_NEUTRAL,
+                z_mode, float(mu), float(sigma),
+                float(z), float(z_edge), float(p_edge), float(conf_raw),
+                float(combined_eff),
+                int(sweeps_count), float(sweep_mult), float(conf_pen),
+                FLOOR, T, C_MAX, float(conf_final),
             )
         except Exception:
-            # لاگ نباید باعث fail شدن آنالیز شود
             pass
 
-        return round(confidence, 1)
+        return round(conf_final, 1)
+
 
 
     def _determine_signal(
