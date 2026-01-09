@@ -967,7 +967,7 @@ class GoldNDSAnalyzer:
 
         # --- RVOL adjustment ---
         rvol_mult = 1.0
-        current_rvol = float(volume_analysis.get('current_rvol', 1.0) or 1.0)
+        current_rvol = float(volume_analysis.get('rvol', 1.0) or 1.0)
         if current_rvol > 1.2:
             rvol_mult *= 1.1
         elif current_rvol < 0.8:
