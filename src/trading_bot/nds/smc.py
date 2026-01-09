@@ -232,7 +232,6 @@ class SMCAnalyzer:
         self._log_info("[NDS][SMC][SWINGS] detected swings=%s", len(all_swings))
 
         if self.debug_smc and all_swings:
-            # نمایش چند سوینگ آخر برای رصد سریع ساختار
             self._log_verbose(
                 "[NDS][SMC][SWINGS] Swing Types: HH=%s, LH=%s, LL=%s, HL=%s",
                 sum(1 for s in all_swings if getattr(s, 'type', None) == SwingType.HH),
@@ -241,7 +240,7 @@ class SMCAnalyzer:
                 sum(1 for s in all_swings if getattr(s, 'type', None) == SwingType.HL),
             )
             tail = all_swings[-3:]
-            for idx, s in enumerate(tail, start=max(1, len(all_swings)-2)):
+            for idx, s in enumerate(tail, start=max(1, len(all_swings) - 2)):
                 self._log_verbose(
                     "[NDS][SMC][SWINGS] Swing %s: %s@%.2f (%s) time=%s",
                     idx,
@@ -310,395 +309,365 @@ class SMCAnalyzer:
 
         return meaningful
 
+    def detect_fvgs(self) -> List[FVG]:
+        """شناسایی FVGها با تشخیص صحیح «باز بودن» (Unfilled) و لاگ مرحله‌ای.
 
-def detect_fvgs(self) -> List[FVG]:
-    """شناسایی FVGها با تشخیص صحیح «باز بودن» (Unfilled) و لاگ مرحله‌ای.
+        مشکل گزارش‌شده (تعداد زیاد FVG اما unfilled=0) معمولاً از اینجا می‌آید که
+        منطق «پر شدن» خیلی سهل‌گیرانه باشد (مثلاً صرفاً لمس لبه‌ی بالایی/پایینی را filled
+        حساب کند). در SMC برای *Mitigation کامل*، بهتر است عبور قیمت از مرز مقابل gap
+        معیار filled باشد.
 
-    مشکل گزارش‌شده (تعداد زیاد FVG اما unfilled=0) معمولاً از اینجا می‌آید که
-    منطق «پر شدن» خیلی سهل‌گیرانه باشد (مثلاً صرفاً لمس لبه‌ی بالایی/پایینی را filled
-    حساب کند). در SMC برای *Mitigation کامل*، بهتر است عبور قیمت از مرز مقابل gap
-    معیار filled باشد.
+        تنظیمات مرتبط:
+        - FVG_MIN_SIZE_MULTIPLIER (پیش‌فرض: 0.1)
+        - FVG_LOOKAHEAD_BARS (پیش‌فرض: 80)
+        - FVG_FILL_MODE: یکی از {"full", "touch"} (پیش‌فرض: "full")
+            * full  : filled=True فقط وقتی کل گپ «میتگیِیت» شود (عبور از مرز مقابل).
+            * touch : filled=True با اولین ورود/لمس ناحیه گپ.
+        """
+        df = self.df
+        fvg_list: List[FVG] = []
 
-    تنظیمات مرتبط:
-    - FVG_MIN_SIZE_MULTIPLIER (پیش‌فرض: 0.1)
-    - FVG_LOOKAHEAD_BARS (پیش‌فرض: 80)
-    - FVG_FILL_MODE: یکی از {"full", "touch"} (پیش‌فرض: "full")
-        * full  : filled=True فقط وقتی کل گپ «میتگیِیت» شود (عبور از مرز مقابل).
-        * touch : filled=True با اولین ورود/لمس ناحیه گپ.
-    """
-    df = self.df
-    fvg_list: List[FVG] = []
+        if len(df) < 3:
+            return fvg_list
 
-    if len(df) < 3:
-        return fvg_list
+        min_fvg_size = float(self.atr * self.settings.get('FVG_MIN_SIZE_MULTIPLIER', 0.1))
+        fill_mode = str(self.settings.get("FVG_FILL_MODE", "full")).strip().lower()
+        if fill_mode not in ("full", "touch"):
+            fill_mode = "full"
 
-    min_fvg_size = float(self.atr * self.settings.get('FVG_MIN_SIZE_MULTIPLIER', 0.1))
-    fill_mode = str(self.settings.get("FVG_FILL_MODE", "full")).strip().lower()
-    if fill_mode not in ("full", "touch"):
-        fill_mode = "full"
-
-    self._log_verbose(
-        "[NDS][SMC][FVG] start | candles=%s atr=%.4f min_size=%.4f fill_mode=%s",
-        len(df),
-        float(self.atr),
-        min_fvg_size,
-        fill_mode,
-    )
-
-    # --- 1) Detection (3-candle pattern) ---
-    for i in range(2, len(df)):
-        # Candle-2 (middle candle) is i-1
-        c2_high = float(df['high'].iloc[i - 1])
-        c2_low = float(df['low'].iloc[i - 1])
-        c2_close = float(df['close'].iloc[i - 1])
-        c2_open = float(df['open'].iloc[i - 1])
-
-        c2_body = abs(c2_close - c2_open)
-        c2_range = max(0.0000001, c2_high - c2_low)  # جلوگیری از تقسیم بر صفر
-
-        # Candle-1 (left) and Candle-3 (right)
-        c1_high = float(df['high'].iloc[i - 2])
-        c1_low = float(df['low'].iloc[i - 2])
-        c3_high = float(df['high'].iloc[i])
-        c3_low = float(df['low'].iloc[i])
-
-        # ---- Bullish FVG: c3_low > c1_high ----
-        if c3_low > c1_high:
-            gap_top = c3_low          # upper boundary
-            gap_bottom = c1_high      # lower boundary
-            gap_size = gap_top - gap_bottom
-
-            body_condition = c2_close > c2_open
-            body_size_condition = c2_body > (c2_range * 0.3)
-            size_condition = gap_size >= min_fvg_size
-
-            volume_condition = True
-            if 'rvol' in df.columns:
-                try:
-                    volume_condition = float(df['rvol'].iloc[i - 1]) > 0.8
-                except (TypeError, ValueError):
-                    volume_condition = True
-
-            if body_condition and body_size_condition and size_condition and volume_condition:
-                strength = 1.0
-                if c2_body > c2_range * 0.7:
-                    strength = 1.5
-                if 'rvol' in df.columns:
-                    try:
-                        if float(df['rvol'].iloc[i - 1]) > 1.5:
-                            strength *= 1.2
-                    except (TypeError, ValueError):
-                        pass
-
-                fvg_list.append(FVG(
-                    type=FVGType.BULLISH,
-                    top=float(gap_top),
-                    bottom=float(gap_bottom),
-                    mid=float((gap_top + gap_bottom) / 2.0),
-                    time=df['time'].iloc[i - 1],
-                    index=i - 1,
-                    size=float(gap_size),
-                    strength=float(strength),
-                ))
-
-        # ---- Bearish FVG: c1_low > c3_high ----
-        if c1_low > c3_high:
-            gap_top = c1_low          # upper boundary
-            gap_bottom = c3_high      # lower boundary
-            gap_size = gap_top - gap_bottom
-
-            body_condition = c2_close < c2_open
-            body_size_condition = c2_body > (c2_range * 0.3)
-            size_condition = gap_size >= min_fvg_size
-
-            volume_condition = True
-            if 'rvol' in df.columns:
-                try:
-                    volume_condition = float(df['rvol'].iloc[i - 1]) > 0.8
-                except (TypeError, ValueError):
-                    volume_condition = True
-
-            if body_condition and body_size_condition and size_condition and volume_condition:
-                strength = 1.0
-                if c2_body > c2_range * 0.7:
-                    strength = 1.5
-                if 'rvol' in df.columns:
-                    try:
-                        if float(df['rvol'].iloc[i - 1]) > 1.5:
-                            strength *= 1.2
-                    except (TypeError, ValueError):
-                        pass
-
-                fvg_list.append(FVG(
-                    type=FVGType.BEARISH,
-                    top=float(gap_top),
-                    bottom=float(gap_bottom),
-                    mid=float((gap_top + gap_bottom) / 2.0),
-                    time=df['time'].iloc[i - 1],
-                    index=i - 1,
-                    size=float(gap_size),
-                    strength=float(strength),
-                ))
-
-    if not fvg_list:
-        self._log_info("[NDS][SMC][FVG] detected=0 unfilled=0")
-        return fvg_list
-
-    # --- 2) Fill / Unfilled evaluation ---
-    lookahead = int(self.settings.get('FVG_LOOKAHEAD_BARS', 80))
-    lookahead = max(3, min(lookahead, len(df)))  # حداقل معنادار
-
-    touched_count = 0
-    filled_count = 0
-
-    for fvg in fvg_list:
-        check_limit = min(fvg.index + lookahead, len(df) - 1)
-
-        if check_limit <= fvg.index + 1:
-            # کندل‌های کافی برای بررسی نداریم → برای اسکلپینگ بهتر است open فرض شود
-            fvg.filled = False
-            continue
-
-        touched = False
-        filled = False
-
-        # منطقه گپ: [bottom, top]
-        top = float(fvg.top)
-        bottom = float(fvg.bottom)
-
-        for j in range(fvg.index + 1, check_limit + 1):
-            high_j = float(df['high'].iloc[j])
-            low_j = float(df['low'].iloc[j])
-
-            # ورود به ناحیه (overlap)
-            if low_j <= top and high_j >= bottom:
-                touched = True
-
-            if fvg.type == FVGType.BULLISH:
-                # Mitigation کامل: عبور low از مرز پایین گپ
-                if low_j <= bottom:
-                    filled = True
-                    break
-            else:  # BEARISH
-                # Mitigation کامل: عبور high از مرز بالای گپ
-                if high_j >= top:
-                    filled = True
-                    break
-
-        if fill_mode == "touch":
-            fvg.filled = touched
-        else:
-            fvg.filled = filled
-
-        if touched:
-            touched_count += 1
-        if fvg.filled:
-            filled_count += 1
-
-    unfilled_count = len(fvg_list) - filled_count
-
-    # --- 3) Logging ---
-    self._log_info("[NDS][SMC][FVG] detected=%s unfilled=%s", len(fvg_list), unfilled_count)
-
-    if self.debug_smc:
-        # نمایش مختصر وضعیت، با تمرکز روی FVGهای باز نزدیک قیمت
-        current_price = float(df['close'].iloc[-1])
-        open_fvgs = [f for f in fvg_list if not getattr(f, "filled", False)]
-        # مرتب‌سازی بر اساس فاصله تا قیمت جاری
-        def _dist(f: FVG) -> float:
-            # فاصله به نزدیک‌ترین لبه
-            return min(abs(current_price - float(f.top)), abs(current_price - float(f.bottom)))
-
-        open_fvgs_sorted = sorted(open_fvgs, key=_dist)[:10]
         self._log_verbose(
-            "[NDS][SMC][FVG] debug | touched=%s filled=%s open=%s (showing up to 10 nearest)",
-            touched_count,
-            filled_count,
-            len(open_fvgs),
+            "[NDS][SMC][FVG] start | candles=%s atr=%.4f min_size=%.4f fill_mode=%s",
+            len(df),
+            float(self.atr),
+            min_fvg_size,
+            fill_mode,
         )
-        for k, f in enumerate(open_fvgs_sorted, start=1):
+
+        # --- 1) Detection (3-candle pattern) ---
+        for i in range(2, len(df)):
+            c2_high = float(df['high'].iloc[i - 1])
+            c2_low = float(df['low'].iloc[i - 1])
+            c2_close = float(df['close'].iloc[i - 1])
+            c2_open = float(df['open'].iloc[i - 1])
+
+            c2_body = abs(c2_close - c2_open)
+            c2_range = max(0.0000001, c2_high - c2_low)
+
+            c1_high = float(df['high'].iloc[i - 2])
+            c1_low = float(df['low'].iloc[i - 2])
+            c3_high = float(df['high'].iloc[i])
+            c3_low = float(df['low'].iloc[i])
+
+            # ---- Bullish FVG: c3_low > c1_high ----
+            if c3_low > c1_high:
+                gap_top = c3_low
+                gap_bottom = c1_high
+                gap_size = gap_top - gap_bottom
+
+                body_condition = c2_close > c2_open
+                body_size_condition = c2_body > (c2_range * 0.3)
+                size_condition = gap_size >= min_fvg_size
+
+                volume_condition = True
+                if 'rvol' in df.columns:
+                    try:
+                        volume_condition = float(df['rvol'].iloc[i - 1]) > 0.8
+                    except (TypeError, ValueError):
+                        volume_condition = True
+
+                if body_condition and body_size_condition and size_condition and volume_condition:
+                    strength = 1.0
+                    if c2_body > c2_range * 0.7:
+                        strength = 1.5
+                    if 'rvol' in df.columns:
+                        try:
+                            if float(df['rvol'].iloc[i - 1]) > 1.5:
+                                strength *= 1.2
+                        except (TypeError, ValueError):
+                            pass
+
+                    fvg_list.append(FVG(
+                        type=FVGType.BULLISH,
+                        top=float(gap_top),
+                        bottom=float(gap_bottom),
+                        mid=float((gap_top + gap_bottom) / 2.0),
+                        time=df['time'].iloc[i - 1],
+                        index=i - 1,
+                        size=float(gap_size),
+                        strength=float(strength),
+                    ))
+
+            # ---- Bearish FVG: c1_low > c3_high ----
+            if c1_low > c3_high:
+                gap_top = c1_low
+                gap_bottom = c3_high
+                gap_size = gap_top - gap_bottom
+
+                body_condition = c2_close < c2_open
+                body_size_condition = c2_body > (c2_range * 0.3)
+                size_condition = gap_size >= min_fvg_size
+
+                volume_condition = True
+                if 'rvol' in df.columns:
+                    try:
+                        volume_condition = float(df['rvol'].iloc[i - 1]) > 0.8
+                    except (TypeError, ValueError):
+                        volume_condition = True
+
+                if body_condition and body_size_condition and size_condition and volume_condition:
+                    strength = 1.0
+                    if c2_body > c2_range * 0.7:
+                        strength = 1.5
+                    if 'rvol' in df.columns:
+                        try:
+                            if float(df['rvol'].iloc[i - 1]) > 1.5:
+                                strength *= 1.2
+                        except (TypeError, ValueError):
+                            pass
+
+                    fvg_list.append(FVG(
+                        type=FVGType.BEARISH,
+                        top=float(gap_top),
+                        bottom=float(gap_bottom),
+                        mid=float((gap_top + gap_bottom) / 2.0),
+                        time=df['time'].iloc[i - 1],
+                        index=i - 1,
+                        size=float(gap_size),
+                        strength=float(strength),
+                    ))
+
+        if not fvg_list:
+            self._log_info("[NDS][SMC][FVG] detected=0 unfilled=0")
+            return fvg_list
+
+        # --- 2) Fill / Unfilled evaluation ---
+        lookahead = int(self.settings.get('FVG_LOOKAHEAD_BARS', 80))
+        lookahead = max(3, min(lookahead, len(df)))
+
+        touched_count = 0
+        filled_count = 0
+
+        for fvg in fvg_list:
+            check_limit = min(fvg.index + lookahead, len(df) - 1)
+
+            if check_limit <= fvg.index + 1:
+                fvg.filled = False
+                continue
+
+            touched = False
+            filled = False
+
+            top = float(fvg.top)
+            bottom = float(fvg.bottom)
+
+            for j in range(fvg.index + 1, check_limit + 1):
+                high_j = float(df['high'].iloc[j])
+                low_j = float(df['low'].iloc[j])
+
+                if low_j <= top and high_j >= bottom:
+                    touched = True
+
+                if fvg.type == FVGType.BULLISH:
+                    if low_j <= bottom:
+                        filled = True
+                        break
+                else:
+                    if high_j >= top:
+                        filled = True
+                        break
+
+            if fill_mode == "touch":
+                fvg.filled = touched
+            else:
+                fvg.filled = filled
+
+            if touched:
+                touched_count += 1
+            if fvg.filled:
+                filled_count += 1
+
+        unfilled_count = len(fvg_list) - filled_count
+
+        # --- 3) Logging ---
+        self._log_info("[NDS][SMC][FVG] detected=%s unfilled=%s", len(fvg_list), unfilled_count)
+
+        if self.debug_smc:
+            current_price = float(df['close'].iloc[-1])
+            open_fvgs = [f for f in fvg_list if not getattr(f, "filled", False)]
+
+            def _dist(f: FVG) -> float:
+                return min(abs(current_price - float(f.top)), abs(current_price - float(f.bottom)))
+
+            open_fvgs_sorted = sorted(open_fvgs, key=_dist)[:10]
             self._log_verbose(
-                "[NDS][SMC][FVG] open #%s | %s | idx=%s time=%s zone=[%.2f-%.2f] size=%.2f strength=%.2f dist=%.2f",
-                k,
-                f.type.value if hasattr(f.type, "value") else str(f.type),
-                getattr(f, "index", -1),
-                getattr(f, "time", "N/A"),
-                float(f.bottom),
-                float(f.top),
-                float(getattr(f, "size", 0.0)),
-                float(getattr(f, "strength", 1.0)),
-                _dist(f),
+                "[NDS][SMC][FVG] debug | touched=%s filled=%s open=%s (showing up to 10 nearest)",
+                touched_count,
+                filled_count,
+                len(open_fvgs),
+            )
+            for k, f in enumerate(open_fvgs_sorted, start=1):
+                self._log_verbose(
+                    "[NDS][SMC][FVG] open #%s | %s | idx=%s time=%s zone=[%.2f-%.2f] size=%.2f strength=%.2f dist=%.2f",
+                    k,
+                    f.type.value if hasattr(f.type, "value") else str(f.type),
+                    getattr(f, "index", -1),
+                    getattr(f, "time", "N/A"),
+                    float(f.bottom),
+                    float(f.top),
+                    float(getattr(f, "size", 0.0)),
+                    float(getattr(f, "strength", 1.0)),
+                    _dist(f),
+                )
+
+        return fvg_list
+
+    def detect_order_blocks(self, lookback: int = 50) -> List[OrderBlock]:
+        """شناسایی Order Block های معتبر به سبک SMC (با فیلتر Fresh/Mitigated) و لاگ مرحله‌ای."""
+        df = self.df
+        order_blocks: List[OrderBlock] = []
+
+        if len(df) < lookback + 5:
+            return order_blocks
+
+        atr = float(self.atr) if self.atr else 0.0
+        min_move_mult = float(self.settings.get("OB_MIN_MOVE_ATR", 1.0))
+        min_move_size = atr * min_move_mult
+
+        self._log_verbose(
+            "[NDS][SMC][OB] start | candles=%s atr=%.4f lookback=%s min_move=%.4f",
+            len(df),
+            atr,
+            lookback,
+            min_move_size,
+        )
+
+        # --- 1) Raw detection ---
+        for i in range(lookback, len(df) - 3):
+            candle_a = df.iloc[i]
+            candle_b = df.iloc[i + 1]
+            candle_c = df.iloc[i + 2]
+
+            is_red = float(candle_a['close']) < float(candle_a['open'])
+            move_up = float(candle_b['close']) - float(candle_a['high'])
+            is_strong_up = (
+                float(candle_b['close']) > float(candle_a['high'])
+                and float(candle_b['close']) > float(candle_b['open'])
+                and (move_up > min_move_size or (float(candle_b['close']) - float(candle_b['open'])) > atr * 0.8)
             )
 
-    return fvg_list
+            if is_red and is_strong_up:
+                strength = 1.0
+                if float(candle_c['close']) > float(candle_b['high']):
+                    strength += 0.5
+                if 'rvol' in df.columns:
+                    try:
+                        if float(df['rvol'].iloc[i + 1]) > 1.2:
+                            strength += 0.5
+                    except (TypeError, ValueError):
+                        pass
 
+                order_blocks.append(OrderBlock(
+                    type='BULLISH_OB',
+                    high=float(candle_a['high']),
+                    low=float(candle_a['low']),
+                    time=candle_a['time'],
+                    index=i,
+                    strength=float(strength),
+                ))
 
-def detect_order_blocks(self, lookback: int = 50) -> List[OrderBlock]:
-    """شناسایی Order Block های معتبر به سبک SMC (با فیلتر Fresh/Mitigated) و لاگ مرحله‌ای.
-
-    منطق پایه:
-    - Bullish OB: آخرین کندل مخالف (قرمز) قبل از displacement صعودی.
-    - Bearish OB: آخرین کندل مخالف (سبز) قبل از displacement نزولی.
-
-    مشکل رایج در پروژه‌های اسکلپ: OB زیاد شناسایی می‌شود اما عملاً همه "میتگیِیت" شده‌اند،
-    یا برعکس همه fresh فرض می‌شوند. برای رصد صحیح، این تابع علاوه بر raw detection،
-    یک فیلتر "fresh" هم اعمال می‌کند.
-
-    تنظیمات مرتبط:
-    - OB_MIN_MOVE_ATR (پیش‌فرض: 1.0)
-    - OB_LOOKAHEAD_BARS (پیش‌فرض: 120)  (برای تشخیص mitigated)
-    - OB_RETURN_LIMIT (پیش‌فرض: 5)      (تعداد خروجی نهایی)
-    """
-    df = self.df
-    order_blocks: List[OrderBlock] = []
-
-    if len(df) < lookback + 5:
-        return order_blocks
-
-    atr = float(self.atr) if self.atr else 0.0
-    min_move_mult = float(self.settings.get("OB_MIN_MOVE_ATR", 1.0))
-    min_move_size = atr * min_move_mult
-
-    self._log_verbose(
-        "[NDS][SMC][OB] start | candles=%s atr=%.4f lookback=%s min_move=%.4f",
-        len(df),
-        atr,
-        lookback,
-        min_move_size,
-    )
-
-    # --- 1) Raw detection ---
-    for i in range(lookback, len(df) - 3):
-        candle_a = df.iloc[i]
-        candle_b = df.iloc[i + 1]
-        candle_c = df.iloc[i + 2]
-
-        # Bullish OB: red candle then strong up displacement
-        is_red = float(candle_a['close']) < float(candle_a['open'])
-        move_up = float(candle_b['close']) - float(candle_a['high'])
-        is_strong_up = (
-            float(candle_b['close']) > float(candle_a['high'])
-            and float(candle_b['close']) > float(candle_b['open'])
-            and (move_up > min_move_size or (float(candle_b['close']) - float(candle_b['open'])) > atr * 0.8)
-        )
-
-        if is_red and is_strong_up:
-            strength = 1.0
-            if float(candle_c['close']) > float(candle_b['high']):
-                strength += 0.5
-            if 'rvol' in df.columns:
-                try:
-                    if float(df['rvol'].iloc[i + 1]) > 1.2:
-                        strength += 0.5
-                except (TypeError, ValueError):
-                    pass
-
-            order_blocks.append(OrderBlock(
-                type='BULLISH_OB',
-                high=float(candle_a['high']),
-                low=float(candle_a['low']),
-                time=candle_a['time'],
-                index=i,
-                strength=float(strength),
-            ))
-
-        # Bearish OB: green candle then strong down displacement
-        is_green = float(candle_a['close']) > float(candle_a['open'])
-        move_down = float(candle_a['low']) - float(candle_b['close'])
-        is_strong_down = (
-            float(candle_b['close']) < float(candle_a['low'])
-            and float(candle_b['close']) < float(candle_b['open'])
-            and (move_down > min_move_size or (float(candle_b['open']) - float(candle_b['close'])) > atr * 0.8)
-        )
-
-        if is_green and is_strong_down:
-            strength = 1.0
-            if float(candle_c['close']) < float(candle_b['low']):
-                strength += 0.5
-            if 'rvol' in df.columns:
-                try:
-                    if float(df['rvol'].iloc[i + 1]) > 1.2:
-                        strength += 0.5
-                except (TypeError, ValueError):
-                    pass
-
-            order_blocks.append(OrderBlock(
-                type='BEARISH_OB',
-                high=float(candle_a['high']),
-                low=float(candle_a['low']),
-                time=candle_a['time'],
-                index=i,
-                strength=float(strength),
-            ))
-
-    self._log_info("[NDS][SMC][OB] detected raw=%s", len(order_blocks))
-    if not order_blocks:
-        return order_blocks
-
-    # --- 2) Fresh/Mitigated filter ---
-    lookahead = int(self.settings.get("OB_LOOKAHEAD_BARS", 120))
-    lookahead = max(10, min(lookahead, len(df)))
-    return_limit = int(self.settings.get("OB_RETURN_LIMIT", 5))
-    return_limit = max(1, min(return_limit, 20))
-
-    fresh_blocks: List[OrderBlock] = []
-    mitigated_count = 0
-
-    for ob in order_blocks:
-        start = int(ob.index) + 1
-        end = min(int(ob.index) + lookahead, len(df) - 1)
-        if start >= len(df):
-            fresh_blocks.append(ob)
-            continue
-
-        ob_high = float(ob.high)
-        ob_low = float(ob.low)
-
-        mitigated = False
-        for j in range(start, end + 1):
-            high_j = float(df['high'].iloc[j])
-            low_j = float(df['low'].iloc[j])
-
-            # اگر کندل بعدی وارد محدوده OB شود → mitigated
-            if low_j <= ob_high and high_j >= ob_low:
-                mitigated = True
-                break
-
-        if mitigated:
-            mitigated_count += 1
-        else:
-            fresh_blocks.append(ob)
-
-    # اولویت با OBهای قوی‌تر و نزدیک‌تر (به انتهای دیتا)
-    fresh_blocks_sorted = sorted(
-        fresh_blocks,
-        key=lambda x: (-(float(getattr(x, "strength", 1.0))), -int(getattr(x, "index", 0))),
-    )
-
-    selected = fresh_blocks_sorted[:return_limit]
-    self._log_verbose(
-        "[NDS][SMC][OB] raw=%s mitigated=%s fresh=%s selected=%s",
-        len(order_blocks),
-        mitigated_count,
-        len(fresh_blocks),
-        len(selected),
-    )
-
-    if self.debug_smc:
-        for k, ob in enumerate(selected, start=1):
-            self._log_verbose(
-                "[NDS][SMC][OB] fresh #%s | %s | idx=%s time=%s range=[%.2f-%.2f] strength=%.2f",
-                k,
-                getattr(ob, "type", "OB"),
-                int(getattr(ob, "index", -1)),
-                getattr(ob, "time", "N/A"),
-                float(getattr(ob, "low", 0.0)),
-                float(getattr(ob, "high", 0.0)),
-                float(getattr(ob, "strength", 1.0)),
+            is_green = float(candle_a['close']) > float(candle_a['open'])
+            move_down = float(candle_a['low']) - float(candle_b['close'])
+            is_strong_down = (
+                float(candle_b['close']) < float(candle_a['low'])
+                and float(candle_b['close']) < float(candle_b['open'])
+                and (move_down > min_move_size or (float(candle_b['open']) - float(candle_b['close'])) > atr * 0.8)
             )
 
-    # برای سازگاری با نسخه‌های قبل، خروجی نهایی محدود می‌شود
-    return selected
+            if is_green and is_strong_down:
+                strength = 1.0
+                if float(candle_c['close']) < float(candle_b['low']):
+                    strength += 0.5
+                if 'rvol' in df.columns:
+                    try:
+                        if float(df['rvol'].iloc[i + 1]) > 1.2:
+                            strength += 0.5
+                    except (TypeError, ValueError):
+                        pass
+
+                order_blocks.append(OrderBlock(
+                    type='BEARISH_OB',
+                    high=float(candle_a['high']),
+                    low=float(candle_a['low']),
+                    time=candle_a['time'],
+                    index=i,
+                    strength=float(strength),
+                ))
+
+        self._log_info("[NDS][SMC][OB] detected raw=%s", len(order_blocks))
+        if not order_blocks:
+            return order_blocks
+
+        # --- 2) Fresh/Mitigated filter ---
+        lookahead = int(self.settings.get("OB_LOOKAHEAD_BARS", 120))
+        lookahead = max(10, min(lookahead, len(df)))
+        return_limit = int(self.settings.get("OB_RETURN_LIMIT", 5))
+        return_limit = max(1, min(return_limit, 20))
+
+        fresh_blocks: List[OrderBlock] = []
+        mitigated_count = 0
+
+        for ob in order_blocks:
+            start = int(ob.index) + 1
+            end = min(int(ob.index) + lookahead, len(df) - 1)
+            if start >= len(df):
+                fresh_blocks.append(ob)
+                continue
+
+            ob_high = float(ob.high)
+            ob_low = float(ob.low)
+
+            mitigated = False
+            for j in range(start, end + 1):
+                high_j = float(df['high'].iloc[j])
+                low_j = float(df['low'].iloc[j])
+
+                if low_j <= ob_high and high_j >= ob_low:
+                    mitigated = True
+                    break
+
+            if mitigated:
+                mitigated_count += 1
+            else:
+                fresh_blocks.append(ob)
+
+        fresh_blocks_sorted = sorted(
+            fresh_blocks,
+            key=lambda x: (-(float(getattr(x, "strength", 1.0))), -int(getattr(x, "index", 0))),
+        )
+
+        selected = fresh_blocks_sorted[:return_limit]
+        self._log_verbose(
+            "[NDS][SMC][OB] raw=%s mitigated=%s fresh=%s selected=%s",
+            len(order_blocks),
+            mitigated_count,
+            len(fresh_blocks),
+            len(selected),
+        )
+
+        if self.debug_smc:
+            for k, ob in enumerate(selected, start=1):
+                self._log_verbose(
+                    "[NDS][SMC][OB] fresh #%s | %s | idx=%s time=%s range=[%.2f-%.2f] strength=%.2f",
+                    k,
+                    getattr(ob, "type", "OB"),
+                    int(getattr(ob, "index", -1)),
+                    getattr(ob, "time", "N/A"),
+                    float(getattr(ob, "low", 0.0)),
+                    float(getattr(ob, "high", 0.0)),
+                    float(getattr(ob, "strength", 1.0)),
+                )
+
+        return selected
 
     def detect_liquidity_sweeps(self, swings: List[SwingPoint], lookback_swings: int = 5) -> List[LiquiditySweep]:
         """
@@ -714,7 +683,7 @@ def detect_order_blocks(self, lookback: int = 50) -> List[OrderBlock]:
 
         atr_value = self.atr
         min_penetration = atr_value * self.settings.get('MIN_SWEEP_PENETRATION_MULTIPLIER', 0.2)
-        max_penetration = atr_value * 3.0  # کاهش سیگنال‌های پرنفوذ غیرواقعی
+        max_penetration = atr_value * 3.0
 
         for _, row in recent_data.iterrows():
             candle_range = row['high'] - row['low']
