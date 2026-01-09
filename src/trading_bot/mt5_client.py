@@ -302,9 +302,6 @@ class MT5Client:
     def __init__(self, logger: logging.Logger = None):
         """
         مقداردهی اولیه کلاینت
-        
-        Args:
-            logger: آبجکت لاگر (اختیاری)
         """
         self.connected = False
         self._logger = logger or logging.getLogger(__name__)
@@ -312,6 +309,12 @@ class MT5Client:
         self.symbol_cache = {}
         self.session_start = None
         self._last_equity_log = None
+        
+        # متغیرهای مستقیم برای دسترسی راحت‌تر و مقداردهی از بیرون
+        self.login = None
+        self.password = None
+        self.server = None
+        self.mt5_path = None
         
         # 🔥 مانیتور Real-Time
         self.real_time_monitor = None
@@ -325,210 +328,161 @@ class MT5Client:
         except ImportError as e:
             self._logger.warning(f"⚠️  Config not found: {e}. Using defaults.")
         
-        # بارگیری تنظیمات اتصال
+        # بارگیری تنظیمات اتصال از فایل‌ها
         self.connection_config = self._load_connection_config()
         
+        # 🔥 همگام‌سازی متغیرهای مستقیم با کانفیگ بارگذاری شده
+        if self.connection_config:
+            self.login = self.connection_config.login
+            self.password = self.connection_config.password
+            self.server = self.connection_config.server
+            self.mt5_path = self.connection_config.mt5_path
+
         # 🔥 کش قیمت‌های لحظه‌ای
         self.tick_cache: Dict[str, Dict[str, Any]] = {}
         self.last_tick_time: Dict[str, datetime] = {}
-    
-    def _load_connection_config(self) -> ConnectionConfig:
-        """بارگذاری تنظیمات اتصال"""
-        config = ConnectionConfig()
+
+    def _load_connection_config(self) -> Any: # فرض شده خروجی ConnectionConfig است
+        """بارگذاری تنظیمات اتصال با رعایت اولویت‌ها"""
+        # اینجا از کلاس داخلی یا ساختار شما استفاده شده است
+        try:
+            from src.trading_bot.nds.models import ConnectionConfig
+        except ImportError:
+            # یک کلاس موقت اگر مدل یافت نشد
+            class ConnectionConfig:
+                def __init__(self):
+                    self.login = 0; self.password = ""; self.server = ""
+                    self.mt5_path = None; self.timeout = 30; self.retry_count = 3
+                    self.real_time_enabled = True; self.tick_update_interval = 1.0
+        
+        config_obj = ConnectionConfig()
         sources = []
         
-        # اولویت 1: config متمرکز
+        # اولویت 1: config متمرکز (Settings.py)
         if self.config:
             try:
-                credentials = self.config.get_mt5_credentials()
-                if credentials:
-                    config.login = credentials.get('login', 0)
-                    config.password = credentials.get('password', '')
-                    config.server = credentials.get('server', '')
-                    config.mt5_path = credentials.get('mt5_path', config.mt5_path)
-                    config.real_time_enabled = credentials.get('real_time_enabled', True)
-                    config.tick_update_interval = credentials.get('tick_update_interval', 1.0)
+                creds = self.config.get_mt5_credentials()
+                if creds:
+                    config_obj.login = creds.get('login', config_obj.login)
+                    config_obj.password = creds.get('password', config_obj.password)
+                    config_obj.server = creds.get('server', config_obj.server)
+                    config_obj.mt5_path = creds.get('mt5_path', config_obj.mt5_path)
+                    config_obj.real_time_enabled = creds.get('real_time_enabled', True)
+                    config_obj.tick_update_interval = creds.get('tick_update_interval', 1.0)
                     sources.append("central config")
             except Exception as e:
                 self._logger.warning(f"Failed to load from central config: {e}")
         
-        # اولویت 2: فایل mt5_credentials.json
-        if not all([config.login, config.password, config.server]):
-            try:
-                possible_paths = [
-                    Path(__file__).parent.parent / "config" / "mt5_credentials.json",
-                    Path(__file__).parent.parent / "mt5_credentials.json",
-                    Path.cwd() / "mt5_credentials.json",
-                ]
-                
-                for file_path in possible_paths:
-                    if file_path.exists():
+        # اولویت 2: بررسی فایل‌های فیزیکی اگر موارد بالا خالی بودند
+        if not all([config_obj.login, config_obj.password, config_obj.server]):
+            possible_paths = [
+                Path.cwd() / "config" / "mt5_credentials.json",
+                Path.cwd() / "mt5_credentials.json",
+                Path(__file__).parent.parent / "config" / "mt5_credentials.json"
+            ]
+            
+            for file_path in possible_paths:
+                if file_path.exists():
+                    try:
                         with open(file_path, 'r', encoding='utf-8') as f:
                             creds = json.load(f)
-                        
                         if all(k in creds for k in ['login', 'password', 'server']):
-                            config.login = creds.get('login', config.login)
-                            config.password = creds.get('password', config.password)
-                            config.server = creds.get('server', config.server)
-                            config.mt5_path = creds.get('mt5_path', config.mt5_path)
-                            config.real_time_enabled = creds.get('real_time_enabled', True)
-                            config.tick_update_interval = creds.get('tick_update_interval', 1.0)
-                            sources.append(f"file: {file_path}")
+                            config_obj.login = creds.get('login')
+                            config_obj.password = creds.get('password')
+                            config_obj.server = creds.get('server')
+                            config_obj.mt5_path = creds.get('mt5_path', config_obj.mt5_path)
+                            sources.append(f"file: {file_path.name}")
                             break
-            except Exception as e:
-                self._logger.warning(f"Failed to load credentials file: {e}")
-        
-        # لاگ اطلاعات
-        if all([config.login, config.password, config.server]):
-            self._logger.info(
-                f"✅ Connection config loaded from: {', '.join(sources) if sources else 'defaults'}\n"
-                f"   Server: {config.server}\n"
-                f"   Account: {config.login}\n"
-                f"   Real-Time: {'✅ Enabled' if config.real_time_enabled else '❌ Disabled'}"
-            )
+                    except Exception as e:
+                        self._logger.debug(f"Skip {file_path}: {e}")
+
+        # لاگ نتیجه نهایی بارگذاری
+        if all([config_obj.login, config_obj.password, config_obj.server]):
+            self._logger.info(f"✅ Connection credentials loaded from: {', '.join(sources)}")
         else:
-            self._logger.warning(
-                "⚠️  MT5 credentials not fully configured.\n"
-                "   Please set them in config/bot_config.json or mt5_credentials.json"
-            )
+            self._logger.warning("⚠️ MT5 credentials are still incomplete.")
         
-        return config
-    
-    def get_account_info(self) -> Optional[Dict[str, Any]]:
-        """
-        دریافت اطلاعات حساب MT5
-        
-        Returns:
-            دیکشنری حاوی اطلاعات حساب یا None در صورت خطا
-        """
-        try:
-            if not self.connected:
-                self._logger.warning("⚠️  Not connected to MT5")
-                return None
-            
-            account_info = mt5.account_info()
-            if account_info is None:
-                error = mt5.last_error()
-                self._logger.error(f"❌ Failed to get account info: {error}")
-                return None
-            
-            # لاگ اطلاعات
-            self._logger.info(
-                f"📊 Account Info:\n"
-                f"   Login: {account_info.login}\n"
-                f"   Balance: ${account_info.balance:.2f}\n"
-                f"   Equity: ${account_info.equity:.2f}\n"
-                f"   Margin: ${account_info.margin:.2f}\n"
-                f"   Free Margin: ${account_info.margin_free:.2f}"
-            )
-            
-            # ساخت دیکشنری اطلاعات
-            info = {
-                'login': account_info.login,
-                'name': account_info.name,
-                'server': account_info.server,
-                'currency': account_info.currency,
-                'company': account_info.company,
-                'balance': account_info.balance,
-                'equity': account_info.equity,
-                'margin': account_info.margin,
-                'free_margin': account_info.margin_free,
-                'margin_level': account_info.margin_level,
-                'leverage': account_info.leverage,
-                'profit': account_info.profit,
-                'trade_mode': account_info.trade_mode,
-                'trade_allowed': account_info.trade_allowed,
-                'trade_expert': account_info.trade_expert,
-            }
-            
-            return info
-            
-        except Exception as e:
-            self._logger.error(f"❌ Error getting account info: {e}")
-            return None
-    
+        return config_obj
+
     def connect(self) -> bool:
-        """اتصال به MT5 با فعال‌سازی Real-Time"""
+        """اتصال به MT5 با استفاده از آخرین داده‌های موجود در کلاس"""
         if self.connected:
-            self._logger.info("Already connected to MT5")
             return True
-        
-        # اعتبارسنجی
-        if not all([self.connection_config.login, 
-                    self.connection_config.password, 
-                    self.connection_config.server]):
-            self._logger.error("Missing MT5 credentials")
+
+        # 🔥 نکته مهم: همگام‌سازی نهایی قبل از اتصال
+        # اگر از بیرون (bot.py) مقادیری ست شده، اولویت با آن‌هاست
+        final_login = self.login or self.connection_config.login
+        final_password = self.password or self.connection_config.password
+        final_server = self.server or self.connection_config.server
+        final_path = self.mt5_path or self.connection_config.mt5_path
+
+        if not all([final_login, final_password, final_server]):
+            self._logger.error(f"❌ Cannot connect: Missing credentials. (Login: {final_login}, Server: {final_server})")
             return False
-        
-        # تلاش برای اتصال
+
         for attempt in range(1, self.connection_config.retry_count + 1):
             try:
-                self._logger.info(f"Connection attempt {attempt}/{self.connection_config.retry_count}")
+                self._logger.info(f"🔄 Connection attempt {attempt}/{self.connection_config.retry_count}...")
                 
-                # Initialize MT5
-                if not mt5.initialize(
-                    path=self.connection_config.mt5_path,
-                    timeout=self.connection_config.timeout * 1000
-                ):
-                    error = mt5.last_error()
-                    self._logger.error(f"Initialize failed: {error}")
-                    
-                    if attempt < self.connection_config.retry_count:
-                        time.sleep(2)
-                    continue
+                # Initialize
+                init_params = {"timeout": self.connection_config.timeout * 1000}
+                if final_path:
+                    init_params["path"] = str(final_path)
                 
-                # Login
-                if not mt5.login(
-                    login=self.connection_config.login,
-                    password=self.connection_config.password,
-                    server=self.connection_config.server
-                ):
-                    error = mt5.last_error()
-                    self._logger.error(f"Login failed: {error}")
-                    mt5.shutdown()
-                    
-                    if attempt < self.connection_config.retry_count:
-                        time.sleep(2)
-                    continue
-                
-                # تأیید اتصال
-                account_info = mt5.account_info()
-                if not account_info:
-                    self._logger.error("Failed to get account info")
-                    mt5.shutdown()
-                    continue
-                
-                # اتصال موفق
-                self.connected = True
-                self.session_start = datetime.now()
-                
-                # 🔥 شروع مانیتورینگ Real-Time
-                if self.connection_config.real_time_enabled:
-                    self.real_time_monitor = RealTimeMonitor(
-                        self, 
-                        self.connection_config.tick_update_interval
-                    )
-                    self.real_time_monitor.start()
-                
-                self._logger.info(f"""
-                ✅ MT5 Connected Successfully!
-                ├── Account: {account_info.login}
-                ├── Server: {account_info.server}
-                ├── Balance: ${account_info.balance:.2f}
-                ├── Equity: ${account_info.equity:.2f}
-                ├── Real-Time: {'✅ Active' if self.connection_config.real_time_enabled else '❌ Inactive'}
-                └── Version: {mt5.version()}
-                """)
-                
-                return True
-                
-            except Exception as e:
-                self._logger.error(f"Connection error on attempt {attempt}: {e}")
-                if attempt < self.connection_config.retry_count:
+                if not mt5.initialize(**init_params):
+                    self._logger.error(f"❌ Initialize failed: {mt5.last_error()}")
                     time.sleep(2)
-        
-        self._logger.error(f"Failed to connect after {self.connection_config.retry_count} attempts")
+                    continue
+
+                # Login
+                if not mt5.login(login=int(final_login), password=final_password, server=final_server):
+                    self._logger.error(f"❌ Login failed: {mt5.last_error()}")
+                    mt5.shutdown()
+                    time.sleep(2)
+                    continue
+
+                # Success
+                account_info = mt5.account_info()
+                if account_info:
+                    self.connected = True
+                    self.session_start = datetime.now()
+                    
+                    # لاگ پیروزی!
+                    self._logger.info(f"✅ Connected to {final_server} | Account: {final_login} | Equity: {account_info.equity}")
+                    
+                    # شروع مانیتورینگ Real-Time
+                    if self.connection_config.real_time_enabled and self.real_time_monitor is None:
+                        try:
+                            from src.trading_bot.mt5_client import RealTimeMonitor # اصلاح مسیر ایمپورت بر اساس پروژه شما
+                            self.real_time_monitor = RealTimeMonitor(self, self.connection_config.tick_update_interval)
+                            self.real_time_monitor.start()
+                        except Exception as e:
+                            self._logger.error(f"⚠️ Could not start RealTimeMonitor: {e}")
+
+                    return True
+            
+            except Exception as e:
+                self._logger.error(f"💥 Critical connection error: {e}")
+                time.sleep(2)
+
         return False
+
+    def get_account_info(self) -> Optional[Dict[str, Any]]:
+        """دریافت و لاگ اطلاعات حساب"""
+        if not self.connected:
+            return None
+        
+        acc = mt5.account_info()
+        if acc is None:
+            return None
+            
+        info = {
+            'login': acc.login, 'balance': acc.balance, 'equity': acc.equity,
+            'margin': acc.margin, 'free_margin': acc.margin_free,
+            'leverage': acc.leverage, 'server': acc.server
+        }
+        self._logger.info(f"📊 Balance: ${info['balance']:.2f} | Equity: ${info['equity']:.2f}")
+        return info
     
     def get_current_tick(self, symbol: str) -> Optional[Dict[str, Any]]:
         """🔥 دریافت قیمت لحظه‌ای (Real-Time)"""
