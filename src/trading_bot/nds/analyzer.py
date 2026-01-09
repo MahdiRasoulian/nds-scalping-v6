@@ -993,7 +993,7 @@ class GoldNDSAnalyzer:
 
         # --- Instrumentation (single-line, deterministic, parse-friendly) ---
         try:
-            self._logger.info(
+            self._log_debug(
                 "[NDS][CONF] score=%.2f base=%.2f vol=%s vol_mult=%.3f "
                 "session=%s weight=%.2f active=%s strong=%s session_mult=%.3f "
                 "rvol=%.2f rvol_mult=%.3f sweeps=%d sweep_mult=%.3f "
