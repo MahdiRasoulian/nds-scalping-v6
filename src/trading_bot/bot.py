@@ -401,29 +401,62 @@ class NDSBot:
             min_candles = self.config.get("trading_rules.MIN_CANDLES_BETWEEN")
 
             status_report = f"""
-🎯 گزارش وضعیت لحظه‌ای سیستم (Real-Time)
-==========================================
-📊 وضعیت اتصال: {conn_status}
-🎯 مانیتور قیمت MT5: {monitor_status}
-💰 اکوئیتی جاری: ${self.config.get('ACCOUNT_BALANCE'):,.2f}
+        🎯 گزارش وضعیت لحظه‌ای سیستم (Real-Time)
+        ==========================================
+        📊 وضعیت اتصال: {conn_status}
+        🎯 مانیتور قیمت MT5: {monitor_status}
+        💰 اکوئیتی جاری: ${self.config.get('ACCOUNT_BALANCE'):,.2f}
 
-📈 وضعیت بازار لحظه‌ای:
-نماد: {symbol}
-Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.2f}
-اسپرد: {current_price.get('spread', 0.0):.2f}
-منبع قیمت: {current_price.get('source', 'Unknown')}
+        📈 وضعیت بازار لحظه‌ای:
+        نماد: {symbol}
+        Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.2f}
+        اسپرد: {current_price.get('spread', 0.0):.2f}
+        منبع قیمت: {current_price.get('source', 'Unknown')}
 
-⚙️ پارامترهای فعال معاملاتی:
-فاصله استراحت: {min_candles} کندل
-حداکثر انحراف مجاز: {max_dev} Pips
-آپدیت قیمت: هر {self.config.get('trading_settings.TICK_UPDATE_INTERVAL')} ثانیه
-==========================================
-"""
+        ⚙️ پارامترهای فعال معاملاتی:
+        فاصله استراحت: {min_candles} کندل
+        حداکثر انحراف مجاز: {max_dev} Pips
+        آپدیت قیمت: هر {self.config.get('trading_settings.TICK_UPDATE_INTERVAL')} ثانیه
+        ==========================================
+        """
             logger.info(status_report)
             print(status_report)
 
         except Exception as e:
             logger.error(f"❌ خطا در تولید گزارش وضعیت: {e}", exc_info=True)
+
+    
+
+    def _log_trade_decision(
+        self,
+        *,
+        cycle_number: int,
+        analyzer_signal: str,
+        final_signal: str,
+        score: float,
+        confidence: float,
+        min_confidence: float,
+        price: float,
+        spread: float,
+        session: str = "",
+        session_weight: float = 0.0,
+        session_activity: str = "",
+        is_active_session: bool = True,
+        untradable: bool = False,
+        reject_reason: str = "-",
+        reject_details: str = "-",
+    ) -> None:
+        """لاگ متمرکز و یک خطی برای تحلیل دقیق تصمیمات ربات"""
+        try:
+            logger.info(
+                f"[BOT][DECISION] cycle={cycle_number} analyzer={analyzer_signal} final={final_signal} "
+                f"score={score:.1f} conf={confidence:.1f} min_conf={min_confidence:.1f} "
+                f"price={price:.2f} spread={spread:.5f} sess={session} weight={session_weight:.2f} "
+                f"act={is_active_session} untradable={untradable} reason={reject_reason} details={reject_details}"
+            )
+        except Exception:
+            pass
+
 
     # ----------------------------
     # Main Cycle
@@ -442,7 +475,7 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
 
         ENTRY_FACTOR = self.config.get("technical_settings.ENTRY_FACTOR")
         MIN_CONFIDENCE = self.config.get("technical_settings.SCALPING_MIN_CONFIDENCE")
-        # اطمینان از اینکه MIN_CONFIDENCE بر حسب درصد (0..100) است
+        
         try:
             MIN_CONFIDENCE = float(MIN_CONFIDENCE or 0)
         except Exception:
@@ -453,14 +486,10 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
         ACCOUNT_BALANCE = self.config.get("ACCOUNT_BALANCE")
 
         logger.info(f"⚙️ تنظیمات نهایی بارگذاری شد: Timeframe={TIMEFRAME}, Min_Candles_Between={MIN_CANDLES_BETWEEN}")
-
-        logger.info(f"\n{'='*60}")
-        logger.info(f"🔄 سیکل تحلیل اسکلپینگ #{cycle_number}")
-        logger.info(f"⏰ زمان: {datetime.now().strftime('%H:%M:%S')}")
-        logger.info(f"{'='*60}")
+        logger.info(f"\n{'='*60}\n🔄 سیکل تحلیل اسکلپینگ #{cycle_number} | ⏰ {datetime.now().strftime('%H:%M:%S')}\n{'='*60}")
 
         try:
-            # 0) مانیتورینگ تریدها (برای تشخیص بسته شدن/آپدیت سود)
+            # 0) مانیتورینگ تریدها
             self._maybe_monitor_trades(force=True)
 
             logger.info(f"📥 دریافت داده‌های {SYMBOL}...")
@@ -470,65 +499,83 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
                 logger.error("❌ داده کافی دریافت نشد")
                 return
 
-            logger.info(f"✅ {len(df)} کندل دریافت شد | قیمت جاری: ${df['close'].iloc[-1]:.2f}")
+            current_price = float(df['close'].iloc[-1])
+            logger.info(f"✅ {len(df)} کندل دریافت شد | قیمت جاری: ${current_price:.2f}")
 
-            # --- استراحت کندلی (استاندارد: زمان کندل) ---
+            # --- استراحت کندلی ---
             if self.bot_state.last_trade_candle_time and not df.empty:
                 last_trade_time = self.bot_state.last_trade_candle_time
                 candles_passed = len(df[df["time"] > last_trade_time])
                 if candles_passed < MIN_CANDLES_BETWEEN:
                     wait_needed = MIN_CANDLES_BETWEEN - candles_passed
-                    logger.info(f"⏸️ استراحت کندلی: {candles_passed} کندل گذشته. نیاز به {wait_needed} کندل دیگر.")
-                    print(f"⏸️ استراحت کندلی: {candles_passed}/{MIN_CANDLES_BETWEEN}")
-                    # حتی در حالت استراحت هم مانیتور را نگه دار
+                    logger.info(f"⏸️ استراحت کندلی: {candles_passed}/{MIN_CANDLES_BETWEEN}")
                     self._maybe_monitor_trades()
                     return
 
             logger.info("🧠 اجرای تحلیل NDS اسکلپینگ...")
-
+            
+            # --- اجرای تحلیل ---
             try:
-                # مسیر A (پیشنهادی): همیشه از تابع ماژول analyze_gold_market استفاده کن
-                if self.analyze_market_func is None:
-                    raise RuntimeError("Analyzer function is not available (analyze_market_func=None)")
-
-                try:
-                    raw_result = self.analyze_market_func(
-                        dataframe=df,
-                        timeframe=TIMEFRAME,
-                        entry_factor=ENTRY_FACTOR,
-                        config=self.analyzer_config,
-                        scalping_mode=True,
-                    )
-                except TypeError:
-                    # برخی نسخه‌ها ممکن است امضای متفاوت داشته باشند
-                    raw_result = self.analyze_market_func(
-                        df,
-                        timeframe=TIMEFRAME,
-                        entry_factor=ENTRY_FACTOR,
-                        config=self.analyzer_config,
-                        scalping_mode=True,
-                    )
-
+                raw_result = self.analyze_market_func(
+                    dataframe=df, timeframe=TIMEFRAME, entry_factor=ENTRY_FACTOR,
+                    config=self.analyzer_config, scalping_mode=True
+                )
                 result = self._result_to_dict(raw_result)
-                if not result:
-                    logger.warning("❌ تحلیل نتیجه خالی برگرداند")
-                    return
-
             except Exception as e:
                 logger.error(f"❌ خطا در اجرای تحلیل: {e}", exc_info=True)
                 return
 
+            if not result:
+                logger.warning("❌ تحلیل نتیجه خالی برگرداند")
+                return
 
+            # --- استخراج داده‌ها برای لاگ تصمیم‌گیری ---
+            analyzer_signal = self._normalize_signal(result.get("signal", "NONE"))
+            score = float(result.get("score", 0.0) or 0.0)
+            confidence = float(result.get("confidence", 0.0) or 0.0)
+            current_spread = float(result.get("spread", 0.0) or 0.0)
+            
+            sess = result.get("session_analysis") or {}
+            session_name = str(sess.get("current_session", "UNKNOWN"))
+            session_weight = float(sess.get("weight", sess.get("session_weight", 0.0)) or 0.0)
+            session_activity = str(sess.get("session_activity", ""))
+            is_active_session = bool(sess.get("is_active_session", True))
+            untradable = bool(sess.get("untradable", False))
+            untradable_reasons = str(sess.get("untradable_reasons", "-"))
 
+            # --- منطق تصمیم‌گیری (Decision Logic) ---
+            final_signal = analyzer_signal
+            reject_reason = "-"
+            reject_details = "-"
 
+            if analyzer_signal not in ("BUY", "SELL"):
+                final_signal = "NONE"
+                reject_reason = "ANALYZER_NONE"
+            elif confidence < MIN_CONFIDENCE:
+                final_signal = "NONE"
+                reject_reason = "CONF_TOO_LOW"
+                reject_details = f"{confidence:.1f} < {MIN_CONFIDENCE:.1f}"
+            elif untradable:
+                final_signal = "NONE"
+                reject_reason = "UNTRADABLE"
+                reject_details = untradable_reasons
+            elif not ENABLE_AUTO_TRADING:
+                final_signal = "NONE"
+                reject_reason = "AUTO_TRADING_OFF"
 
-            # نرمال‌سازی سیگنال
-            result["signal"] = self._normalize_signal(result.get("signal", "NONE"))
+            # ثبت لاگ متمرکز تصمیم
+            self._log_trade_decision(
+                cycle_number=cycle_number, analyzer_signal=analyzer_signal, final_signal=final_signal,
+                score=score, confidence=confidence, min_confidence=MIN_CONFIDENCE,
+                price=current_price, spread=current_spread, session=session_name,
+                session_weight=session_weight, session_activity=session_activity,
+                is_active_session=is_active_session, untradable=untradable,
+                reject_reason=reject_reason, reject_details=reject_details
+            )
 
+            # نمایش نتایج در کنسول (همان تابع قبلی شما)
+            result["signal"] = final_signal # آپدیت سیگنال نهایی در دیکشنری
             self.display_results(result)
-
-            signal_value = result.get("signal", "NONE")
-            confidence = float(result.get("confidence", 0) or 0)
 
             self.bot_state.analysis_count += 1
             self.bot_state.last_analysis = datetime.now()
@@ -537,14 +584,12 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
                 logger.warning("⚠️ سیگنال حاوی خطاست")
                 return
 
-            # فقط BUY/SELL اجازه ترید دارند
-            if (signal_value in ("BUY", "SELL")) and (confidence >= MIN_CONFIDENCE) and ENABLE_AUTO_TRADING:
+            # --- اجرای معامله ---
+            if final_signal in ("BUY", "SELL"):
                 # محدودیت تعداد پوزیشن
                 open_positions = self.get_open_positions_count()
                 if open_positions >= MAX_POS:
                     logger.info(f"⏸️ حداکثر پوزیشن باز ({MAX_POS}) تکمیل است.")
-                    if WAIT_CLOSE:
-                        return
                     return
 
                 # بررسی ریسک منیجر
@@ -557,19 +602,18 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
                 if not ENABLE_DRY_RUN:
                     trade_success = self.execute_scalping_trade(result, df)
                     if trade_success:
-                        # ✅ زمان معامله بر اساس زمان کندل (برای محاسبه candles_passed)
                         self.bot_state.last_trade_candle_time = df["time"].iloc[-1]
                         self.bot_state.last_trade_wall_time = datetime.now()
                         self.bot_state.last_trade_time = self.bot_state.last_trade_wall_time
-                        logger.info(f"✅ معامله در زمان کندل {self.bot_state.last_trade_candle_time} ثبت شد")
-                        # مانیتورینگ فوری بعد از ارسال سفارش
+                        logger.info(f"✅ معامله ثبت شد")
                         self._maybe_monitor_trades(force=True)
                 else:
                     logger.info("🔧 حالت آزمایشی فعال است (Dry Run)")
             else:
-                logger.info(f"⏸️ سیگنال خنثی/ضعیف | signal={signal_value} confidence={confidence}%")
+                # لاگ تکمیلی برای زمانی که سیگنال تایید نشد
+                if reject_reason != "-":
+                    logger.info(f"⏸️ تصمیم رد شد | دلیل: {reject_reason} | {reject_details}")
 
-            # در پایان هر سیکل، مجدداً مانیتور کنیم تا closeها از دست نرود
             self._maybe_monitor_trades(force=True)
 
         except Exception as e:
