@@ -267,16 +267,29 @@ class GoldNDSAnalyzer:
         self.GOLD_SETTINGS.update(tf_settings)
 
     def _analyze_trading_sessions(self, volume_analysis: Dict[str, Any]) -> SessionAnalysis:
-        """تحلیل جامع سشن‌های معاملاتی"""
+        """تحلیل جامع سشن‌های معاملاتی
+
+        سیاست جدید:
+        - current_session/weight/activity فقط کیفیت هستند.
+        - is_active_session فقط وقتی False می‌شود که واقعاً untradable باشیم (market closed, data ناقص, spread غیرعادی, ...).
+        """
         last_time = self.df['time'].iloc[-1]
         hour = last_time.hour
 
         session_info = self._is_valid_trading_session(last_time)
-        rvol = float(volume_analysis.get('rvol', 1.0))
+
+        # ---- RVOL (NaN-safe) ----
+        rvol = volume_analysis.get('rvol', 1.0)
+        try:
+            rvol = float(rvol)
+        except Exception:
+            rvol = 1.0
         if pd.isna(rvol):
             rvol = 1.0
-        volume_trend = volume_analysis.get('volume_trend', 'NEUTRAL')
 
+        volume_trend = str(volume_analysis.get('volume_trend', 'NEUTRAL') or 'NEUTRAL').upper()
+
+        # ---- Activity (Quality only) ----
         if rvol > 1.2 or volume_trend == 'INCREASING':
             session_activity = 'HIGH'
         elif rvol < 0.8 and volume_trend == 'DECREASING':
@@ -284,25 +297,80 @@ class GoldNDSAnalyzer:
         else:
             session_activity = 'NORMAL'
 
+        # ---- Determine "untradable" (Active/Inactive واقعی) ----
+        # این کلیدها ممکن است در پروژه نباشند؛ اگر نباشند هیچ مشکلی نیست.
+        market_status = str(volume_analysis.get("market_status", "") or "").upper()  # e.g. OPEN/CLOSED/HALTED
+        data_ok = volume_analysis.get("data_ok", None)  # True/False if available
+
+        spread = volume_analysis.get("spread", None)       # numeric if available
+        max_spread = volume_analysis.get("max_spread", None)  # numeric if available
+
+        untradable_reasons = []
+        untradable = False
+
+        # 1) invalid/parse failure from session_info (خیلی مهم)
+        if not bool(session_info.get('is_valid', True)):
+            untradable = True
+            untradable_reasons.append("invalid_time")
+
+        # 2) market status (optional)
+        if market_status in ("CLOSED", "HALTED"):
+            untradable = True
+            untradable_reasons.append(f"market_status={market_status}")
+
+        # 3) data ok flag (optional)
+        if data_ok is False:
+            untradable = True
+            untradable_reasons.append("data_ok=False")
+
+        # 4) spread sanity (optional)
+        if spread is not None and max_spread is not None:
+            try:
+                if float(spread) > float(max_spread):
+                    untradable = True
+                    untradable_reasons.append(f"spread={float(spread):.4f}>max={float(max_spread):.4f}")
+            except Exception:
+                # اگر قابل تبدیل نبود، تصمیم‌گیری را به این معیار وابسته نکن
+                pass
+
+        is_active_session = (not untradable)
+
         analysis = SessionAnalysis(
             current_session=session_info.get('session', 'OTHER'),
             session_weight=session_info.get('weight', 0.5),
             weight=session_info.get('weight', 0.5),
             gmt_hour=hour,
-            is_active_session=session_info.get('is_valid', False),
+            # سیاست جدید: active فقط برای untradable false می‌شود
+            is_active_session=is_active_session,
             is_overlap=session_info.get('is_overlap', False),
             session_activity=session_activity,
-            optimal_trading=session_info.get('optimal_trading', session_info.get('weight', 0.5) >= 1.2)
+            optimal_trading=session_info.get(
+                'optimal_trading',
+                session_info.get('weight', 0.5) >= 1.2
+            )
         )
 
-        self._log_info(
-            "[NDS][SESSIONS] current=%s weight=%.2f activity=%s overlap=%s",
-            analysis.current_session,
-            analysis.weight,
-            analysis.session_activity,
-            analysis.is_overlap,
-        )
+        # لاگ ارتقا یافته: active و دلیل untradable هم چاپ می‌شود
+        try:
+            reasons_str = ",".join(untradable_reasons) if untradable_reasons else "-"
+            self._log_info(
+                "[NDS][SESSIONS] current=%s weight=%.2f activity=%s overlap=%s active=%s untradable=%s reasons=%s rvol=%.2f trend=%s",
+                analysis.current_session,
+                float(analysis.weight),
+                analysis.session_activity,
+                bool(analysis.is_overlap),
+                bool(analysis.is_active_session),
+                bool(untradable),
+                reasons_str,
+                float(rvol),
+                volume_trend,
+            )
+        except Exception:
+            # لاگ نباید تحلیل را fail کند
+            pass
+
         return analysis
+
 
     def _hour_in_session(self, hour: int, start: int, end: int) -> bool:
         """بررسی ساعت داخل بازه [start, end) با پشتیبانی از عبور از نیمه‌شب."""
@@ -312,8 +380,15 @@ class GoldNDSAnalyzer:
             return start <= hour < end
         return hour >= start or hour < end
 
+
     def _is_valid_trading_session(self, check_time: datetime) -> Dict[str, Any]:
-        """بررسی سشن معاملاتی با پشتیبانی از نام‌های جدید و قدیم"""
+        """بررسی سشن معاملاتی با پشتیبانی از نام‌های جدید و قدیم
+
+        سیاست جدید:
+        - is_valid دیگر به معنی "primary session" نیست.
+        - is_valid فقط یعنی timestamp معتبر/قابل‌تحلیل است (نه تعطیلی بازار).
+        - تشخیص untradable در _analyze_trading_sessions انجام می‌شود (با data_ok/spread/market_status).
+        """
         if not isinstance(check_time, datetime):
             try:
                 check_time = pd.to_datetime(check_time)
@@ -366,13 +441,15 @@ class GoldNDSAnalyzer:
         optimal_trading = session_weight >= 1.0
 
         return {
-            'is_valid': session_weight >= 1.0,
+            # سیاست جدید: معتبر بودن timestamp
+            'is_valid': True,
             'is_overlap': is_overlap,
             'session': session_name,
             'weight': session_weight,
             'hour': hour,
             'optimal_trading': optimal_trading
         }
+
 
     def generate_trading_signal(
         self,
@@ -931,7 +1008,11 @@ class GoldNDSAnalyzer:
 
         نکته عملیاتی:
         - این تابع باید کاملاً قابل ردیابی (traceable) باشد تا هر ناسازگاری بین SCORE و CONFIDENCE
-          در لاگ‌ها سریعاً قابل کشف باشد.
+        در لاگ‌ها سریعاً قابل کشف باشد.
+
+        سیاست جدید:
+        - session_weight و activity فقط کیفیت هستند.
+        - inactive penalty (×0.8) فقط برای untradable واقعی اعمال می‌شود.
         """
         # --- Base from score distance to neutral (50) ---
         base_confidence = abs(normalized_score - 50) * 2.4
@@ -947,27 +1028,74 @@ class GoldNDSAnalyzer:
 
         # --- Session adjustment ---
         session_mult = 1.0
-        session_name = getattr(session_analysis, "current_session", "UNKNOWN")
+        session_name = str(getattr(session_analysis, "current_session", "UNKNOWN") or "UNKNOWN")
         session_weight = float(getattr(session_analysis, "session_weight", 1.0) or 1.0)
-        is_active_session = bool(getattr(session_analysis, "is_active_session", True))
 
+        # upstream flag (بعد از اصلاح upstream باید معنی درست داشته باشد)
+        upstream_active = bool(getattr(session_analysis, "is_active_session", True))
+
+        # activity (کیفیت)
+        session_activity = str(
+            getattr(session_analysis, "session_activity",
+                    getattr(session_analysis, "activity", "UNKNOWN"))
+            or "UNKNOWN"
+        ).upper()
+
+        # strong_signal guard
+        strong_signal = abs(normalized_score - 50) > 15
+
+        # 1) Quality penalties/bonuses
         if session_weight < 0.6:
-            # در سشن‌های کم‌وزن (معمولاً ASIA) محافظه‌کارتر باش
             session_mult *= 0.75
 
-        # strong_signal guard: فقط زمانی معتبر است که تحلیلگر واقعاً سیگنال قوی داشته باشد
-        # (اگر upstream مقدار دیگری پاس دهد، instrumentation کمک می‌کند سریع کشف شود)
-        strong_signal = abs(normalized_score - 50) > 15
         if strong_signal and session_weight > 0.8:
             session_mult *= 1.15
-        if not is_active_session:
+
+        # 2) Determine "effective_active" (فقط untradable خاموش می‌کند)
+        # untradable signals are optional and may not exist
+        market_status = str(volume_analysis.get("market_status", "") or "").upper()
+        data_ok = volume_analysis.get("data_ok", None)
+        spread = volume_analysis.get("spread", None)
+        max_spread = volume_analysis.get("max_spread", None)
+
+        untradable = False
+        untradable_reasons = []
+
+        if market_status in ("CLOSED", "HALTED"):
+            untradable = True
+            untradable_reasons.append(f"market_status={market_status}")
+
+        if data_ok is False:
+            untradable = True
+            untradable_reasons.append("data_ok=False")
+
+        if spread is not None and max_spread is not None:
+            try:
+                if float(spread) > float(max_spread):
+                    untradable = True
+                    untradable_reasons.append(f"spread={float(spread):.4f}>max={float(max_spread):.4f}")
+            except Exception:
+                pass
+
+        # effective_active: اگر upstream false بود ولی هیچ untradable نداریم، override به true
+        effective_active = upstream_active
+        if (not upstream_active) and (not untradable):
+            effective_active = True
+
+        # inactive penalty فقط برای untradable واقعی
+        if not effective_active:
             session_mult *= 0.8
 
         base_confidence *= session_mult
 
         # --- RVOL adjustment ---
         rvol_mult = 1.0
-        current_rvol = float(volume_analysis.get('rvol', 1.0) or 1.0)
+        current_rvol = volume_analysis.get('rvol', 1.0)
+        try:
+            current_rvol = float(current_rvol)
+        except Exception:
+            current_rvol = 1.0
+
         if current_rvol > 1.2:
             rvol_mult *= 1.1
         elif current_rvol < 0.8:
@@ -993,9 +1121,10 @@ class GoldNDSAnalyzer:
 
         # --- Instrumentation (single-line, deterministic, parse-friendly) ---
         try:
+            reasons_str = ",".join(untradable_reasons) if untradable_reasons else "-"
             self._log_info(
                 "[NDS][CONF] score=%.2f base=%.2f vol=%s vol_mult=%.3f "
-                "session=%s weight=%.2f active=%s strong=%s session_mult=%.3f "
+                "session=%s weight=%.2f activity=%s upstream_active=%s effective_active=%s untradable=%s reasons=%s strong=%s session_mult=%.3f "
                 "rvol=%.2f rvol_mult=%.3f sweeps=%d sweep_mult=%.3f "
                 "range_mult=%.3f -> conf=%.2f",
                 float(normalized_score),
@@ -1004,7 +1133,11 @@ class GoldNDSAnalyzer:
                 float(vol_mult),
                 session_name,
                 float(session_weight),
-                bool(is_active_session),
+                session_activity,
+                bool(upstream_active),
+                bool(effective_active),
+                bool(untradable),
+                reasons_str,
                 bool(strong_signal),
                 float(session_mult),
                 float(current_rvol),
@@ -1019,6 +1152,7 @@ class GoldNDSAnalyzer:
             pass
 
         return round(confidence, 1)
+
 
     def _determine_signal(
         self,
