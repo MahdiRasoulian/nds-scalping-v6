@@ -1,12 +1,14 @@
 """
 NDS Trading Bot Pro - Main Entry Point
 نسخه ماژولار - منطبق با ساختار src.trading_bot.*
-یکپارچه با ConfigManager موجود در config/settings.py
-بهبود یافته برای جلوگیری از دو منبع RiskManager و خروج ایمن
+✅ منبع حقیقت واحد: bot_config.json
+✅ بدون وابستگی به config/settings.py (حذف شده)
+✅ خروج ایمن با SIGINT
 """
 
 import sys
 import os
+import json
 import signal
 import logging
 from pathlib import Path
@@ -23,10 +25,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # ------------------------------------------------------------
 # 2) Imports (Project)
+#    نکته: هیچ import از config.settings نباید وجود داشته باشد.
 # ------------------------------------------------------------
 try:
     from src.utils.logger import setup_windows_encoding, setup_logging
-    from config.settings import config as config_manager
     from src.trading_bot.bot import NDSBot
     from src.trading_bot.mt5_client import MT5Client
     from src.trading_bot.nds.analyzer import analyze_gold_market
@@ -39,37 +41,135 @@ except ImportError as e:
 
 
 # ------------------------------------------------------------
-# 3) Logging Setup
+# 3) Config Loading (Single Source: bot_config.json)
+# ------------------------------------------------------------
+def _find_bot_config_path() -> Path:
+    """
+    مسیر bot_config.json را به صورت مقاوم پیدا می‌کند.
+    اولویت‌ها:
+      1) ./config/bot_config.json
+      2) ./bot_config.json
+      3) هر جایی داخل پروژه که config/bot_config.json وجود داشت (fallback ساده)
+    """
+    candidates = [
+        PROJECT_ROOT / "config" / "bot_config.json",
+        PROJECT_ROOT / "bot_config.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+
+    # fallback: جست‌وجوی محدود
+    for p in PROJECT_ROOT.rglob("bot_config.json"):
+        return p
+
+    raise FileNotFoundError("bot_config.json not found in project.")
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("bot_config.json must be a JSON object (dict).")
+    return data
+
+
+class ConfigAdapter:
+    """
+    آداپتر سبک برای کانفیگ پروژه بر پایه bot_config.json
+    - get با کلیدهای dot.notation
+    - متدهای کمکی رایج که bot/mt5_client معمولا نیاز دارند
+    """
+
+    def __init__(self, data: Dict[str, Any], source_path: Optional[Path] = None):
+        self._config: Dict[str, Any] = data or {}
+        self._source_path = source_path
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if not key:
+            return default
+        # پشتیبانی از کلید تو در تو: "risk_settings.RISK_AMOUNT_USD"
+        parts = key.split(".")
+        cur: Any = self._config
+        for part in parts:
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                return default
+        return cur
+
+    def get_full_config(self) -> Dict[str, Any]:
+        return dict(self._config)
+
+    # --- APIهای موردنیاز در bot.py (بر اساس کد شما) ---
+    def update_setting(self, key: str, value: Any) -> None:
+        # کلید ساده (نه dot) را در ریشه می‌نویسد، چون کد bot.py شما همین رفتار را انتظار دارد
+        self._config[key] = value
+        self._persist_if_possible()
+
+    def get_mt5_credentials(self) -> Optional[Dict[str, Any]]:
+        creds = self._config.get("mt5_credentials") or self._config.get("MT5_CREDENTIALS")
+        return creds if isinstance(creds, dict) else None
+
+    def save_mt5_credentials(self, creds: Dict[str, Any]) -> None:
+        if not isinstance(creds, dict):
+            return
+        # طبق عرف، در bot_config.json بهتر است در mt5_credentials ذخیره شود
+        self._config["mt5_credentials"] = creds
+        self._persist_if_possible()
+
+    def get_full_config_for_analyzer(self) -> Dict[str, Any]:
+        # اگر در پروژه شما ساختار خاصی دارید، اینجا همان را برمی‌گردانیم.
+        # فعلاً کل کانفیگ + تکنیکال‌ها به عنوان ANALYZER_SETTINGS
+        cfg = self.get_full_config()
+        tech = cfg.get("technical_settings", {}) or {}
+        if "ANALYZER_SETTINGS" not in cfg:
+            cfg["ANALYZER_SETTINGS"] = tech
+        return cfg
+
+    def get_risk_manager_config(self) -> Dict[str, Any]:
+        rm = self._config.get("risk_manager_config", {}) or {}
+        return rm if isinstance(rm, dict) else {}
+
+    def get_sessions_config(self) -> Dict[str, Any]:
+        sc = self._config.get("sessions_config", {}) or {}
+        return sc if isinstance(sc, dict) else {}
+
+    def get_technical_settings(self) -> Dict[str, Any]:
+        ts = self._config.get("technical_settings", {}) or {}
+        return ts if isinstance(ts, dict) else {}
+
+    def _persist_if_possible(self) -> None:
+        # اگر مایل باشید، این بخش bot_config.json را هم آپدیت می‌کند.
+        # اگر دوست ندارید config در زمان اجرا نوشته شود، این را کامنت کنید.
+        try:
+            if self._source_path and self._source_path.exists():
+                with open(self._source_path, "w", encoding="utf-8") as f:
+                    json.dump(self._config, f, ensure_ascii=False, indent=2)
+        except Exception:
+            # برای جلوگیری از شکست برنامه، persist را silent می‌کنیم
+            pass
+
+
+# ------------------------------------------------------------
+# 4) Logging Setup
 # ------------------------------------------------------------
 setup_windows_encoding()
-setup_logging()
+
+# تلاش برای تزریق کانفیگ به setup_logging (اگر نسخه‌ی جدید logger.py این را پشتیبانی کند)
 logger = logging.getLogger(__name__)
 
 
-def _safe_get_full_config() -> Dict[str, Any]:
-    """
-    تلاش برای دریافت کانفیگ کامل بدون وابستگی شکننده به private field.
-    """
-    # اگر متد رسمی دارید، اولویت با آن است:
-    for method_name in ("get_full_config", "get_config", "to_dict"):
-        method = getattr(config_manager, method_name, None)
-        if callable(method):
-            try:
-                cfg = method()
-                if isinstance(cfg, dict):
-                    return cfg
-            except Exception:
-                pass
-
-    # fallback: دسترسی به _config با محافظ
-    cfg = getattr(config_manager, "_config", None)
-    return cfg if isinstance(cfg, dict) else {}
+def _setup_logging_safely(cfg: Dict[str, Any]) -> None:
+    try:
+        # اگر setup_logging(config_dict=...) پشتیبانی شود
+        setup_logging(config_dict=cfg)
+    except TypeError:
+        # نسخه قدیمی‌تر: بدون پارامتر
+        setup_logging()
 
 
 def _print_active_settings(full_config: Dict[str, Any]) -> None:
-    """
-    نمایش تنظیمات فعال (فقط برای اطمینان اپراتور).
-    """
     trading_settings = full_config.get("trading_settings", {}) or {}
     risk_settings = full_config.get("risk_settings", {}) or {}
 
@@ -81,24 +181,19 @@ def _print_active_settings(full_config: Dict[str, Any]) -> None:
     print(f"  • AutoTrading: {trading_settings.get('ENABLE_AUTO_TRADING', False)}")
     print(f"  • DryRun: {trading_settings.get('ENABLE_DRY_RUN', False)}")
 
-    # ریسک
     print("\n🛡️  تنظیمات ریسک (Config):")
-    # ممکن است پروژه شما هم RISK_PERCENT داشته باشد هم RISK_AMOUNT_USD؛ هر دو را نمایش می‌دهیم
     if "RISK_AMOUNT_USD" in risk_settings:
         print(f"  • ریسک ثابت دلاری: ${risk_settings.get('RISK_AMOUNT_USD', 0.0)}")
     if "RISK_PERCENT" in risk_settings:
         print(f"  • ریسک درصدی: {risk_settings.get('RISK_PERCENT', 0.0)}%")
-
-    # حداقل اطمینان (ممکن است در technical_settings باشد؛ اینجا فقط اگر در risk_settings بود)
-    if "MIN_CONFIDENCE" in risk_settings:
-        print(f"  • حداقل اعتماد (risk_settings): {risk_settings.get('MIN_CONFIDENCE', 0)}%")
+    if "MAX_PRICE_DEVIATION_PIPS" in risk_settings:
+        print(f"  • Max Deviation: {risk_settings.get('MAX_PRICE_DEVIATION_PIPS', 0)} pips")
 
 
+# ------------------------------------------------------------
+# 5) Main
+# ------------------------------------------------------------
 def main() -> None:
-    """
-    تابع اصلی اجرای برنامه
-    """
-
     # پاکسازی کنسول (اختیاری)
     try:
         os.system("cls" if os.name == "nt" else "clear")
@@ -108,45 +203,74 @@ def main() -> None:
     print("🚀 NDS Gold Scalping Bot - در حال اجرا ...")
 
     try:
-        # 1) Load config safely
-        print("⏳ در حال بارگذاری تنظیمات از config/bot_config.json ...")
-        full_config = _safe_get_full_config()
+        # Load config from bot_config.json
+        cfg_path = _find_bot_config_path()
+        print(f"⏳ در حال بارگذاری تنظیمات از: {cfg_path}")
+        full_config = _load_json(cfg_path)
+        config_manager = ConfigAdapter(full_config, source_path=cfg_path)
+
+        # Setup logging using loaded config (if supported)
+        _setup_logging_safely(full_config)
+        global logger
+        logger = logging.getLogger(__name__)
 
         if not full_config:
-            print("⚠️  هشدار: کانفیگ کامل بارگذاری نشد. بررسی config/settings.py و bot_config.json ضروری است.")
-            logger.warning("Full config is empty or not loaded.")
+            print("⚠️  هشدار: کانفیگ خالی است. bot_config.json را بررسی کنید.")
+            logger.warning("Full config is empty.")
 
-        # 2) Minimal sanity checks (credentials existence)
-        try:
-            creds = config_manager.get_mt5_credentials()
-        except Exception:
-            creds = None
-
+        # Minimal MT5 credentials check
+        creds = config_manager.get_mt5_credentials()
         if not creds or not all(k in creds for k in ("login", "password", "server")):
-            print("⚠️  اطلاعات MT5 کامل نیست. لطفاً mt5_credentials را در config تنظیم کنید.")
-            logger.warning("MT5 credentials incomplete.")
+            print("⚠️  اطلاعات MT5 کامل نیست. بخش mt5_credentials در bot_config.json را بررسی کنید.")
+            logger.warning("MT5 credentials incomplete or missing in bot_config.json.")
 
-        # 3) Print active settings snapshot
+        # Print active settings snapshot
         _print_active_settings(full_config)
 
-        # 4) Create bot (Single source of truth: bot will create its own RiskManager + monitors)
         print("\n📦 ماژول‌های فعال:")
         print(f"  • MT5 Client: {MT5Client.__name__}")
         print("  • Risk Manager: managed inside NDSBot.initialize()")
         print("  • Analyzer: analyze_gold_market (NDS/SMC Modular)")
 
+        # MT5Client factory: inject config into instance after creation (hardened)
+        def mt5_factory():
+            client = MT5Client(logger=logging.getLogger("src.trading_bot.mt5_client"))
+            # اگر MT5Client شما قابلیت config داخلی دارد، تزریق می‌کنیم
+            try:
+                client.config = config_manager  # type: ignore[attr-defined]
+                # اگر متد load config دوباره لازم است
+                if hasattr(client, "_load_connection_config"):
+                    client.connection_config = client._load_connection_config()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return client
+
+        # Create bot
         bot = NDSBot(
-            mt5_client_cls=MT5Client,
-            risk_manager_cls=None,   # مدیریت داخلی توسط initialize
+            mt5_client_cls=mt5_factory,      # به جای کلاس مستقیم، فکتوری می‌دهیم
+            risk_manager_cls=None,
             analyzer_cls=None,
             analyze_func=analyze_gold_market
         )
 
-        # 5) Signal handling (Safe stop: do NOT sys.exit immediately)
+        # تزریق کانفیگ واحد به bot (اگر bot.config داشته باشد)
+        try:
+            bot.config = config_manager  # اگر در bot استفاده می‌شود
+            # analyzer config هم از همین منبع
+            bot.analyzer_config = config_manager.get_full_config_for_analyzer()
+            # اگر price_monitor قبلاً با config قبلی ساخته شده، اینجا جایگزین می‌کنیم
+            if hasattr(bot, "price_monitor") and bot.price_monitor:
+                try:
+                    bot.price_monitor.config = config_manager  # type: ignore
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Signal handling (Safe stop: do NOT sys.exit immediately)
         def signal_handler(sig, frame):
             print("\n🛑 درخواست توقف دریافت شد. ربات به صورت ایمن متوقف می‌شود...")
             logger.info("SIGINT received. Requesting safe shutdown...")
-
             try:
                 if hasattr(bot, "bot_state") and bot.bot_state:
                     bot.bot_state.running = False
@@ -155,16 +279,14 @@ def main() -> None:
 
         signal.signal(signal.SIGINT, signal_handler)
 
-        # 6) Run bot
+        # Run bot
         print("\n🎯 شروع چرخه معاملاتی اسکلپینگ طلا")
         bot.run()
 
-        # 7) After run finishes (normal shutdown)
         print("\n✅ اجرای ربات پایان یافت.")
         logger.info("Bot run finished normally.")
 
     except KeyboardInterrupt:
-        # در حالت عادی signal handler این را مدیریت می‌کند؛ این فقط fallback است
         print("\n🛑 توقف توسط کاربر (KeyboardInterrupt)")
         logger.info("KeyboardInterrupt in main().")
 
