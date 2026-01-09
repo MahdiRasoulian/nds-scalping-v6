@@ -595,6 +595,19 @@ class GoldNDSAnalyzer:
     def _bounded(self, value: float, minimum: float = -1.0, maximum: float = 1.0) -> float:
         return max(minimum, min(maximum, value))
 
+    def _min_stop_distance(self, atr_value: float) -> float:
+        """Minimum logical SL distance from entry (in price units, e.g., USD for XAUUSD).
+
+        This is a safety guardrail to prevent inverted/degenerate SL placement due to
+        swing-anchor selection or noisy structure levels.
+        """
+        try:
+            k = float(self.GOLD_SETTINGS.get("MIN_STOP_ATR_MULT", 0.35))
+        except Exception:
+            k = 0.35
+        return max(0.01, float(atr_value) * k)
+
+
     def _apply_adx_override(
         self,
         structure: MarketStructure,
@@ -1221,33 +1234,97 @@ class GoldNDSAnalyzer:
             fallback_min_adx,
             fallback_min_structure,
         )
-
         def finalize_trade(entry: float, stop: float, target: Optional[float], reason: str) -> Dict[str, Optional[float]]:
+            """Finalize and validate trade idea geometry.
+
+            Hard guarantees:
+              BUY:  stop < entry < target
+              SELL: target < entry < stop
+
+            If SL is on the wrong side due to swing-anchor/structure issues, we correct it to a
+            minimum ATR-based distance. If geometry still invalid, we invalidate the idea.
+            """
             if entry is None or stop is None:
+                idea["reason"] = "Invalid entry/stop (None)"
+                self._log_info("[NDS][ENTRY_IDEA][INVALID] %s", idea["reason"])
                 return idea
+
+            entry = float(entry)
+            stop = float(stop)
+
+            # Minimum stop distance (guardrail)
+            min_stop = self._min_stop_distance(atr_value)
+
+            # Enforce SL side (correct if needed)
+            if signal == "BUY":
+                if stop >= entry - 1e-9:
+                    corrected = entry - min_stop
+                    self._log_info(
+                        "[NDS][ENTRY_IDEA][FIX] BUY stop was not below entry: stop=%.2f entry=%.2f -> stop=%.2f (min_stop=%.2f)",
+                        stop,
+                        entry,
+                        corrected,
+                        min_stop,
+                    )
+                    stop = corrected
+            else:  # SELL
+                if stop <= entry + 1e-9:
+                    corrected = entry + min_stop
+                    self._log_info(
+                        "[NDS][ENTRY_IDEA][FIX] SELL stop was not above entry: stop=%.2f entry=%.2f -> stop=%.2f (min_stop=%.2f)",
+                        stop,
+                        entry,
+                        corrected,
+                        min_stop,
+                    )
+                    stop = corrected
+
             risk = abs(entry - stop)
             if risk <= 0:
+                idea["reason"] = f"Invalid risk: entry={entry:.2f} stop={stop:.2f}"
+                self._log_info("[NDS][ENTRY_IDEA][INVALID] %s", idea["reason"])
                 return idea
+
+            # Build/adjust TP
             if target is None:
                 if signal == "BUY":
                     target = entry + risk * tp_multiplier
                 else:
                     target = entry - risk * tp_multiplier
+
+            target = float(target)
+
+            # Enforce minimum RR
             rr_target = entry + risk * min_rr if signal == "BUY" else entry - risk * min_rr
             if signal == "BUY":
                 target = max(target, rr_target)
             else:
                 target = min(target, rr_target)
 
+            # Final geometry validation
+            if signal == "BUY":
+                valid = (stop < entry < target)
+            else:
+                valid = (target < entry < stop)
+
+            if not valid:
+                idea["reason"] = f"Invalid geometry for {signal}: tp={target:.2f} entry={entry:.2f} sl={stop:.2f}"
+                self._log_info("[NDS][ENTRY_IDEA][INVALID] %s", idea["reason"])
+                return idea
+
             idea["entry_price"] = entry
             idea["stop_loss"] = stop
             idea["take_profit"] = target
             idea["reason"] = reason
-            self._log_debug(
-                "[NDS][ENTRY_IDEA] finalized entry=%.2f stop=%.2f target=%.2f reason=%s",
+
+            self._log_info(
+                "[NDS][ENTRY_IDEA] finalized signal=%s entry=%.2f sl=%.2f tp=%.2f risk=%.2f rr=%.2f reason=%s",
+                signal,
                 entry,
                 stop,
                 target,
+                risk,
+                (abs(target - entry) / risk) if risk > 0 else 0.0,
                 reason,
             )
             return idea
