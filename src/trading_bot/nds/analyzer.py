@@ -993,6 +993,31 @@ class GoldNDSAnalyzer:
             score,
             breakdown['sub_scores'],
         )
+
+        # INFO-level scoring trace (single-line, parse-friendly)
+        try:
+            contribs = {k: float(weights[k]) * float(breakdown['sub_scores'][k]) for k in weights}
+            self._log_info(
+                "[NDS][SCORE_BREAKDOWN] structure_sub=%.4f (w=%.2f c=%.4f) "
+                "trend_sub=%.4f (w=%.2f c=%.4f) "
+                "fvg_sub=%.4f (w=%.2f c=%.4f) "
+                "sweeps_sub=%.4f (w=%.2f c=%.4f) "
+                "ob_sub=%.4f (w=%.2f c=%.4f) "
+                "volume_session_sub=%.4f (w=%.2f c=%.4f) "
+                "-> total_weighted=%.4f formula=50+0.5*total clamp(0..100) score=%.2f",
+                float(breakdown['sub_scores']['structure']), float(weights['structure']), float(contribs['structure']),
+                float(breakdown['sub_scores']['trend']), float(weights['trend']), float(contribs['trend']),
+                float(breakdown['sub_scores']['fvg']), float(weights['fvg']), float(contribs['fvg']),
+                float(breakdown['sub_scores']['sweeps']), float(weights['sweeps']), float(contribs['sweeps']),
+                float(breakdown['sub_scores']['order_blocks']), float(weights['order_blocks']), float(contribs['order_blocks']),
+                float(breakdown['sub_scores']['volume_session']), float(weights['volume_session']), float(contribs['volume_session']),
+                float(total_weighted), float(score),
+            )
+        except Exception:
+            pass
+
+
+
         return score, reasons, breakdown
 
     def _calculate_confidence(
