@@ -64,7 +64,6 @@ try:
         analyze_gold_market = None
     logger.info("✅ NDS analyzer module imported successfully")
 except ImportError as e:
-
     logger.critical(f"❌ NDS analyzer module not found: {e}")
     print(f"\n❌ خطا: ماژول تحلیل NDS یافت نشد")
     print(f"   لطفاً از وجود فایل‌های زیر اطمینان حاصل کنید:")
@@ -101,7 +100,6 @@ class NDSBot:
         self.analyzer_config = None
         self.analyzer = None  # instance of GoldNDSAnalyzer (preferred)
 
-
         self.price_monitor = RealTimePriceMonitor(config=self.config, bot_state=self.bot_state, logger=logger)
         self.trade_tracker = TradeTracker()
         self.user_controls = UserControls(self, logger)
@@ -115,113 +113,113 @@ class NDSBot:
     # ----------------------------
     # Helpers
     # ----------------------------
-def _result_to_dict(self, result: Any) -> Dict[str, Any]:
-    """سازگارکننده خروجی آنالایزر به قرارداد قابل مصرف توسط bot.py و risk_manager.
+    def _result_to_dict(self, result: Any) -> Dict[str, Any]:
+        """سازگارکننده خروجی آنالایزر به قرارداد قابل مصرف توسط bot.py و risk_manager.
 
-    پشتیبانی:
-    - dict (همان را برمی‌گرداند)
-    - AnalysisResult/dataclass (از __dict__ + context استخراج می‌کند)
+        پشتیبانی:
+        - dict (همان را برمی‌گرداند)
+        - AnalysisResult/dataclass (از __dict__ + context استخراج می‌کند)
 
-    استانداردهای خروجی برای مصرف داخلی Bot:
-    - signal (BUY/SELL/NONE)
-    - confidence به صورت درصد 0..100 (نه 0..1)
-    - score (0..100)
-    - market_metrics: atr, atr_short, adx, plus_di, minus_di, current_rvol
-    - structure: trend, bos, choch, last_high, last_low, score, range
-    - entry_price / stop_loss / take_profit (اگر ایده ورود موجود باشد)
-    - reasons: لیست دلایل (برای نمایش و گزارش)
-    """
-    if result is None:
+        استانداردهای خروجی برای مصرف داخلی Bot:
+        - signal (BUY/SELL/NONE)
+        - confidence به صورت درصد 0..100 (نه 0..1)
+        - score (0..100)
+        - market_metrics: atr, atr_short, adx, plus_di, minus_di, current_rvol
+        - structure: trend, bos, choch, last_high, last_low, score, range
+        - entry_price / stop_loss / take_profit (اگر ایده ورود موجود باشد)
+        - reasons: لیست دلایل (برای نمایش و گزارش)
+        """
+        if result is None:
+            return {}
+
+        if isinstance(result, dict):
+            return self._normalize_result_dict(result)
+
+        if hasattr(result, "__dict__"):
+            d = dict(getattr(result, "__dict__", {}) or {})
+            return self._normalize_result_dict(d)
+
         return {}
 
-    if isinstance(result, dict):
-        return self._normalize_result_dict(result)
+    def _normalize_result_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize a raw analyzer dict into bot contract."""
+        if not isinstance(d, dict):
+            return {}
 
-    if hasattr(result, "__dict__"):
-        d = dict(getattr(result, "__dict__", {}) or {})
-        return self._normalize_result_dict(d)
+        ctx = d.get("context") if isinstance(d.get("context"), dict) else {}
 
-    return {}
+        # --- signal ---
+        d["signal"] = self._normalize_signal(d.get("signal", "NONE"))
 
-def _normalize_result_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a raw analyzer dict into bot contract."""
-    if not isinstance(d, dict):
-        return {}
+        # --- confidence normalization (0..100) ---
+        conf = d.get("confidence", 0) or 0
+        try:
+            conf_f = float(conf)
+        except Exception:
+            conf_f = 0.0
+        # اگر خروجی 0..1 بود، به درصد تبدیل کن
+        if 0.0 <= conf_f <= 1.0:
+            conf_f *= 100.0
+        d["confidence"] = conf_f
 
-    ctx = d.get("context") if isinstance(d.get("context"), dict) else {}
+        # --- score normalization ---
+        try:
+            d["score"] = float(d.get("score", 0) or 0)
+        except Exception:
+            d["score"] = 0.0
 
-    # --- signal ---
-    d["signal"] = self._normalize_signal(d.get("signal", "NONE"))
+        # --- reasons ---
+        if not d.get("reasons"):
+            if isinstance(ctx.get("reasons"), list):
+                d["reasons"] = ctx["reasons"]
+            else:
+                d["reasons"] = []
 
-    # --- confidence normalization (0..100) ---
-    conf = d.get("confidence", 0) or 0
-    try:
-        conf_f = float(conf)
-    except Exception:
-        conf_f = 0.0
-    # اگر خروجی 0..1 بود، به درصد تبدیل کن
-    if 0.0 <= conf_f <= 1.0:
-        conf_f *= 100.0
-    d["confidence"] = conf_f
+        # --- market_metrics ---
+        market_metrics = d.get("market_metrics") if isinstance(d.get("market_metrics"), dict) else {}
+        if ctx:
+            for src_k, dst_k in (
+                ("atr", "atr"),
+                ("atr_short", "atr_short"),
+                ("adx", "adx"),
+                ("plus_di", "plus_di"),
+                ("minus_di", "minus_di"),
+                ("rvol", "current_rvol"),
+            ):
+                if dst_k not in market_metrics and src_k in ctx:
+                    market_metrics[dst_k] = ctx.get(src_k)
+        d["market_metrics"] = market_metrics
 
-    # --- score normalization ---
-    try:
-        d["score"] = float(d.get("score", 0) or 0)
-    except Exception:
-        d["score"] = 0.0
+        # --- structure ---
+        structure = d.get("structure") if isinstance(d.get("structure"), dict) else {}
+        if ctx and isinstance(ctx.get("structure"), dict):
+            structure.update(ctx["structure"])
+        if "last_high" not in structure and "high" in structure:
+            structure["last_high"] = structure.get("high")
+        if "last_low" not in structure and "low" in structure:
+            structure["last_low"] = structure.get("low")
+        d["structure"] = structure
 
-    # --- reasons ---
-    if not d.get("reasons"):
-        if isinstance(ctx.get("reasons"), list):
-            d["reasons"] = ctx["reasons"]
-        else:
-            d["reasons"] = []
+        # --- entry idea extraction ---
+        entry_idea = ctx.get("entry_idea") if isinstance(ctx.get("entry_idea"), dict) else None
+        if entry_idea:
+            if d.get("entry_price") is None and entry_idea.get("entry_price") is not None:
+                d["entry_price"] = entry_idea.get("entry_price")
+            if d.get("stop_loss") is None and entry_idea.get("stop_loss") is not None:
+                d["stop_loss"] = entry_idea.get("stop_loss")
+            if d.get("take_profit") is None and entry_idea.get("take_profit") is not None:
+                d["take_profit"] = entry_idea.get("take_profit")
+            if entry_idea.get("reason") and not d.get("entry_reason"):
+                d["entry_reason"] = entry_idea.get("reason")
 
-    # --- market_metrics ---
-    market_metrics = d.get("market_metrics") if isinstance(d.get("market_metrics"), dict) else {}
-    if ctx:
-        for src_k, dst_k in (
-            ("atr", "atr"),
-            ("atr_short", "atr_short"),
-            ("adx", "adx"),
-            ("plus_di", "plus_di"),
-            ("minus_di", "minus_di"),
-            ("rvol", "current_rvol"),
-        ):
-            if dst_k not in market_metrics and src_k in ctx:
-                market_metrics[dst_k] = ctx.get(src_k)
-    d["market_metrics"] = market_metrics
+        # --- session info ---
+        if ctx and isinstance(ctx.get("session"), dict) and "session_analysis" not in d:
+            d["session_analysis"] = ctx.get("session")
 
-    # --- structure ---
-    structure = d.get("structure") if isinstance(d.get("structure"), dict) else {}
-    if ctx and isinstance(ctx.get("structure"), dict):
-        structure.update(ctx["structure"])
-    if "last_high" not in structure and "high" in structure:
-        structure["last_high"] = structure.get("high")
-    if "last_low" not in structure and "low" in structure:
-        structure["last_low"] = structure.get("low")
-    d["structure"] = structure
+        if "scalping_mode" not in d:
+            d["scalping_mode"] = True
 
-    # --- entry idea extraction ---
-    entry_idea = ctx.get("entry_idea") if isinstance(ctx.get("entry_idea"), dict) else None
-    if entry_idea:
-        if d.get("entry_price") is None and entry_idea.get("entry_price") is not None:
-            d["entry_price"] = entry_idea.get("entry_price")
-        if d.get("stop_loss") is None and entry_idea.get("stop_loss") is not None:
-            d["stop_loss"] = entry_idea.get("stop_loss")
-        if d.get("take_profit") is None and entry_idea.get("take_profit") is not None:
-            d["take_profit"] = entry_idea.get("take_profit")
-        if entry_idea.get("reason") and not d.get("entry_reason"):
-            d["entry_reason"] = entry_idea.get("reason")
-
-    # --- session info ---
-    if ctx and isinstance(ctx.get("session"), dict) and "session_analysis" not in d:
-        d["session_analysis"] = ctx.get("session")
-
-    if "scalping_mode" not in d:
-        d["scalping_mode"] = True
-
-    return d
+        return d
 
     def _normalize_signal(self, signal_value: str) -> str:
         """
@@ -251,23 +249,22 @@ def _normalize_result_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
         """🔥 مقداردهی اولیه ربات و اتصال به سرویس‌ها (نسخه Real-Time حرفه‌ای - اصلاح‌شده)"""
         logger.info("🔧 در حال راه‌اندازی ربات اسکلپینگ Real-Time...")
         print("\n🔧 در حال راه‌اندازی ربات اسکلپینگ Real-Time...")
-    
+
         try:
             # ------------------------------------------------------------
             # 1) ایجاد MT5 Client
             # ------------------------------------------------------------
             if self.mt5_client is None:
                 self.mt5_client = self.MT5Client_cls()
-    
+
             # ------------------------------------------------------------
             # 2) اعمال تنظیمات Real-Time از bot_config.json روی MT5Client
-            #    (بدون وابستگی شکننده به get_mt5_credentials و بدون overwrite اجباری فایل credentials)
             # ------------------------------------------------------------
             try:
                 tick_interval = self.config.get("trading_settings.TICK_UPDATE_INTERVAL", 1.0)
             except Exception:
                 tick_interval = 1.0
-    
+
             # اگر MT5Client شما ConnectionConfig دارد، مستقیم همان را تنظیم کن
             try:
                 if hasattr(self.mt5_client, "connection_config") and self.mt5_client.connection_config:
@@ -278,17 +275,15 @@ def _normalize_result_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
                     logger.debug("ℹ️ MT5Client has no connection_config; skipping real-time config injection.")
             except Exception as e:
                 logger.warning(f"⚠️ Unable to apply real-time settings to MT5Client: {e}")
-    
+
             # ------------------------------------------------------------
             # 3) اتصال به MT5
-            #    منبع واقعی credentials باید MT5Client باشد (central config یا mt5_credentials.json)
-            #    اینجا دیگر bot را به credentials dict وابسته نمی‌کنیم.
             # ------------------------------------------------------------
             if not self.mt5_client.connect():
                 logger.error("❌ اتصال به MT5 ناموفق بود.")
                 print("❌ اتصال به MT5 ناموفق بود. فایل config/mt5_credentials.json و مسیر mt5_path را بررسی کنید.")
                 return False
-    
+
             # ------------------------------------------------------------
             # 4) آپدیت موجودی (Equity/Balance)
             # ------------------------------------------------------------
@@ -298,12 +293,11 @@ def _normalize_result_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
                 try:
                     self.config.update_setting("ACCOUNT_BALANCE", current_equity)
                 except Exception:
-                    # اگر ConfigManager ذخیره دائمی ندارد، صرفاً لاگ کن
                     pass
                 logger.info(f"💰 حساب متصل شد | موجودی لحظه‌ای: ${current_equity:,.2f}")
             else:
                 logger.warning("⚠️ اتصال برقرار شد اما account_info دریافت نشد (mt5.account_info=None).")
-    
+
             # ------------------------------------------------------------
             # 5) شروع مانیتورینگ قیمت (سیستم داخلی پروژه)
             # ------------------------------------------------------------
@@ -315,12 +309,12 @@ def _normalize_result_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
                     logger.warning(f"⚠️ Price monitor failed to start: {e}")
             else:
                 logger.debug("ℹ️ price_monitor not available on bot instance; skipping.")
-    
+
             # ------------------------------------------------------------
             # 6) آماده‌سازی آنالایزر
             # ------------------------------------------------------------
             logger.info("🧠 در حال هماهنگ‌سازی تنظیمات آنالایزر با استراتژی SMC...")
-    
+
             try:
                 self.analyzer_config = self.config.get_full_config_for_analyzer()
             except Exception:
@@ -329,16 +323,16 @@ def _normalize_result_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
                     "ANALYZER_SETTINGS": self.config.get("technical_settings", {}) if hasattr(self.config, "get") else {},
                     "TRADING_SESSIONS": {},
                 }
-    
+
             if "ANALYZER_SETTINGS" not in self.analyzer_config or not isinstance(self.analyzer_config.get("ANALYZER_SETTINGS"), dict):
                 self.analyzer_config["ANALYZER_SETTINGS"] = self.config.get("technical_settings", {})
-    
+
             tech_settings = self.analyzer_config.get("ANALYZER_SETTINGS", {}) or {}
             try:
                 adx_weak = self.config.get("technical_settings.ADX_THRESHOLD_WEAK", tech_settings.get("ADX_THRESHOLD_WEAK"))
             except Exception:
                 adx_weak = tech_settings.get("ADX_THRESHOLD_WEAK")
-    
+
             analyzer_settings = {
                 **tech_settings,
                 "ADX_THRESHOLD_WEAK": adx_weak,
@@ -347,7 +341,6 @@ def _normalize_result_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
             }
             self.analyzer_config = {**self.analyzer_config, "ANALYZER_SETTINGS": analyzer_settings}
 
-# ------------------------------------------------------------
             # ------------------------------------------------------------
             # 6.1) ایجاد نمونه آنالایزر (GoldNDSAnalyzer) با کانفیگ نهایی
             # ------------------------------------------------------------
@@ -357,9 +350,9 @@ def _normalize_result_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as e:
                 self.analyzer = None
                 logger.warning(f"⚠️ Failed to create GoldNDSAnalyzer instance: {e}", exc_info=True)
-# ------------------------------------------------------------
+
+            # ------------------------------------------------------------
             # 7) ایجاد Risk Manager
-            #    توجه: اینجا فقط از bot_config.json می‌خوانیم و overrides را جمع‌وجور نگه می‌داریم.
             # ------------------------------------------------------------
             try:
                 scalping_config = {
@@ -376,13 +369,13 @@ def _normalize_result_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
                 logger.error(f"⚠️ RiskManager creation failed: {e}", exc_info=True)
                 # fallback حداقلی (اگر تابع اجازه دهد)
                 self.risk_manager = create_scalping_risk_manager(overrides={})
-    
+
             logger.info("✅ ربات با موفقیت عملیاتی شد.")
             try:
                 self._log_real_time_status()
             except Exception:
                 pass
-    
+
             # ------------------------------------------------------------
             # 8) همگام‌سازی اولیه وضعیت معاملات با MT5 (در صورت وجود)
             # ------------------------------------------------------------
@@ -391,13 +384,12 @@ def _normalize_result_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
                 self._maybe_monitor_trades(force=True)
             except Exception as e:
                 logger.warning(f"⚠️ Initial trade sync failed: {e}")
-    
+
             return True
-    
+
         except Exception as e:
             logger.critical(f"❌ خطای بحرانی در Initialize: {e}", exc_info=True)
             return False
-
 
     def _log_real_time_status(self):
         """🔥 گزارش وضعیت واقعی و داینامیک سیستم"""
@@ -494,6 +486,7 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
                     # حتی در حالت استراحت هم مانیتور را نگه دار
                     self._maybe_monitor_trades()
                     return
+
             logger.info("🧠 اجرای تحلیل NDS اسکلپینگ...")
 
             try:
@@ -754,55 +747,55 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
     # ----------------------------
     # Trade Execution
     # ----------------------------
-# ----------------------------
-# Trade Geometry Guards
-# ----------------------------
-def _extract_trade_levels(self, signal_data: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Extract entry/sl/tp from either root keys or nested analyzer context."""
-    entry = signal_data.get("entry_price")
-    sl = signal_data.get("stop_loss")
-    tp = signal_data.get("take_profit")
+    # ----------------------------
+    # Trade Geometry Guards
+    # ----------------------------
+    def _extract_trade_levels(self, signal_data: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """Extract entry/sl/tp from either root keys or nested analyzer context."""
+        entry = signal_data.get("entry_price")
+        sl = signal_data.get("stop_loss")
+        tp = signal_data.get("take_profit")
 
-    # برخی خروجی‌ها ممکن است از RiskManager نهایی شده باشند
-    if entry is None and signal_data.get("final_entry") is not None:
-        entry = signal_data.get("final_entry")
-    if sl is None and signal_data.get("final_stop_loss") is not None:
-        sl = signal_data.get("final_stop_loss")
-    if tp is None and signal_data.get("final_take_profit") is not None:
-        tp = signal_data.get("final_take_profit")
+        # برخی خروجی‌ها ممکن است از RiskManager نهایی شده باشند
+        if entry is None and signal_data.get("final_entry") is not None:
+            entry = signal_data.get("final_entry")
+        if sl is None and signal_data.get("final_stop_loss") is not None:
+            sl = signal_data.get("final_stop_loss")
+        if tp is None and signal_data.get("final_take_profit") is not None:
+            tp = signal_data.get("final_take_profit")
 
-    try:
-        entry_f = float(entry) if entry is not None else None
-    except Exception:
-        entry_f = None
-    try:
-        sl_f = float(sl) if sl is not None else None
-    except Exception:
-        sl_f = None
-    try:
-        tp_f = float(tp) if tp is not None else None
-    except Exception:
-        tp_f = None
+        try:
+            entry_f = float(entry) if entry is not None else None
+        except Exception:
+            entry_f = None
+        try:
+            sl_f = float(sl) if sl is not None else None
+        except Exception:
+            sl_f = None
+        try:
+            tp_f = float(tp) if tp is not None else None
+        except Exception:
+            tp_f = None
 
-    return entry_f, sl_f, tp_f
+        return entry_f, sl_f, tp_f
 
-def _validate_trade_geometry(self, side: str, entry: Optional[float], sl: Optional[float], tp: Optional[float]) -> Tuple[bool, str]:
-    """Hard validation of SL/TP placement relative to entry."""
-    side = self._normalize_signal(side)
-    if side not in ("BUY", "SELL"):
-        return False, f"Invalid side={side}"
+    def _validate_trade_geometry(self, side: str, entry: Optional[float], sl: Optional[float], tp: Optional[float]) -> Tuple[bool, str]:
+        """Hard validation of SL/TP placement relative to entry."""
+        side = self._normalize_signal(side)
+        if side not in ("BUY", "SELL"):
+            return False, f"Invalid side={side}"
 
-    if entry is None or sl is None or tp is None:
-        return False, f"Missing levels: entry={entry} sl={sl} tp={tp}"
+        if entry is None or sl is None or tp is None:
+            return False, f"Missing levels: entry={entry} sl={sl} tp={tp}"
 
-    if side == "BUY":
-        if not (sl < entry < tp):
-            return False, f"Invalid BUY geometry: sl={sl:.2f} entry={entry:.2f} tp={tp:.2f}"
-    else:
-        if not (tp < entry < sl):
-            return False, f"Invalid SELL geometry: tp={tp:.2f} entry={entry:.2f} sl={sl:.2f}"
+        if side == "BUY":
+            if not (sl < entry < tp):
+                return False, f"Invalid BUY geometry: sl={sl:.2f} entry={entry:.2f} tp={tp:.2f}"
+        else:
+            if not (tp < entry < sl):
+                return False, f"Invalid SELL geometry: tp={tp:.2f} entry={entry:.2f} sl={sl:.2f}"
 
-    return True, "OK"
+        return True, "OK"
 
     def execute_scalping_trade(self, signal_data: dict, df=None) -> bool:
         """🔥 اجرای معامله اسکلپینگ با Real-Time، ثبت گزارش و ذخیره JSON"""
@@ -823,8 +816,7 @@ def _validate_trade_geometry(self, side: str, entry: Optional[float], sl: Option
             return False
 
         # ------------------------------------------------------------
-        # Guardrail: اعتبارسنجی هندسه معامله (جلوگیری از Entry بالاتر از SL/TP در SELL و بالعکس)
-        # این چک مستقل از RiskManager است و قبل از finalize_order اجرا می‌شود.
+        # Guardrail: اعتبارسنجی هندسه معامله
         # ------------------------------------------------------------
         try:
             entry, sl, tp = self._extract_trade_levels(signal_data)
