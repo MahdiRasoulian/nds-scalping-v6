@@ -173,92 +173,146 @@ class NDSBot:
     # Initialize
     # ----------------------------
     def initialize(self) -> bool:
-        """🔥 مقداردهی اولیه ربات و اتصال به سرویس‌ها (نسخه Real-Time حرفه‌ای)"""
+        """🔥 مقداردهی اولیه ربات و اتصال به سرویس‌ها (نسخه Real-Time حرفه‌ای - اصلاح‌شده)"""
         logger.info("🔧 در حال راه‌اندازی ربات اسکلپینگ Real-Time...")
         print("\n🔧 در حال راه‌اندازی ربات اسکلپینگ Real-Time...")
-
+    
         try:
+            # ------------------------------------------------------------
             # 1) ایجاد MT5 Client
+            # ------------------------------------------------------------
             if self.mt5_client is None:
                 self.mt5_client = self.MT5Client_cls()
-
-            # 2) اعمال credential های real-time در config متمرکز (در صورت وجود)
-            credentials = self.config.get_mt5_credentials()
-            tick_interval = self.config.get("trading_settings.TICK_UPDATE_INTERVAL")
-
-            if credentials:
-                credentials["real_time_enabled"] = True
-                credentials["tick_update_interval"] = tick_interval
-                self.config.save_mt5_credentials(credentials)
-                logger.info(f"✅ تنظیمات Real-Time (Interval: {tick_interval}s) به کانفیگ MT5 اعمال شد")
-
-            # 3) مدیریت ورود/اتصال
-            if not credentials or not all(k in credentials for k in ["login", "password", "server"]):
-                logger.warning("❌ اطلاعات حساب MT5 ناقص است.")
-                print("❌ اطلاعات حساب MT5 ناقص است. لطفاً در config/bot_config.json تکمیل کنید.")
-                return False
-
-            # این فیلدها در MT5Client شما داخل ConnectionConfig استفاده می‌شود،
-            # اما نگه می‌داریم چون شاید در کلاس شما استفاده می‌شود.
-            self.mt5_client.login = int(credentials["login"])
-            self.mt5_client.password = credentials["password"]
-            self.mt5_client.server = credentials["server"]
-
+    
+            # ------------------------------------------------------------
+            # 2) اعمال تنظیمات Real-Time از bot_config.json روی MT5Client
+            #    (بدون وابستگی شکننده به get_mt5_credentials و بدون overwrite اجباری فایل credentials)
+            # ------------------------------------------------------------
+            try:
+                tick_interval = self.config.get("trading_settings.TICK_UPDATE_INTERVAL", 1.0)
+            except Exception:
+                tick_interval = 1.0
+    
+            # اگر MT5Client شما ConnectionConfig دارد، مستقیم همان را تنظیم کن
+            try:
+                if hasattr(self.mt5_client, "connection_config") and self.mt5_client.connection_config:
+                    self.mt5_client.connection_config.real_time_enabled = True
+                    self.mt5_client.connection_config.tick_update_interval = float(tick_interval)
+                    logger.info(f"✅ Real-Time enabled | tick_update_interval={tick_interval}s")
+                else:
+                    logger.debug("ℹ️ MT5Client has no connection_config; skipping real-time config injection.")
+            except Exception as e:
+                logger.warning(f"⚠️ Unable to apply real-time settings to MT5Client: {e}")
+    
+            # ------------------------------------------------------------
+            # 3) اتصال به MT5
+            #    منبع واقعی credentials باید MT5Client باشد (central config یا mt5_credentials.json)
+            #    اینجا دیگر bot را به credentials dict وابسته نمی‌کنیم.
+            # ------------------------------------------------------------
             if not self.mt5_client.connect():
                 logger.error("❌ اتصال به MT5 ناموفق بود.")
+                print("❌ اتصال به MT5 ناموفق بود. فایل config/mt5_credentials.json و مسیر mt5_path را بررسی کنید.")
                 return False
-
-            # 4) آپدیت موجودی
+    
+            # ------------------------------------------------------------
+            # 4) آپدیت موجودی (Equity/Balance)
+            # ------------------------------------------------------------
             account_info = self.mt5_client.get_account_info()
             if account_info:
                 current_equity = account_info.get("equity") or account_info.get("balance") or 0.0
-                self.config.update_setting("ACCOUNT_BALANCE", current_equity)
+                try:
+                    self.config.update_setting("ACCOUNT_BALANCE", current_equity)
+                except Exception:
+                    # اگر ConfigManager ذخیره دائمی ندارد، صرفاً لاگ کن
+                    pass
                 logger.info(f"💰 حساب متصل شد | موجودی لحظه‌ای: ${current_equity:,.2f}")
-
+            else:
+                logger.warning("⚠️ اتصال برقرار شد اما account_info دریافت نشد (mt5.account_info=None).")
+    
+            # ------------------------------------------------------------
             # 5) شروع مانیتورینگ قیمت (سیستم داخلی پروژه)
-            self.price_monitor.set_mt5_client(self.mt5_client)
-            self.price_monitor.start()
-
+            # ------------------------------------------------------------
+            if getattr(self, "price_monitor", None) is not None:
+                try:
+                    self.price_monitor.set_mt5_client(self.mt5_client)
+                    self.price_monitor.start()
+                except Exception as e:
+                    logger.warning(f"⚠️ Price monitor failed to start: {e}")
+            else:
+                logger.debug("ℹ️ price_monitor not available on bot instance; skipping.")
+    
+            # ------------------------------------------------------------
             # 6) آماده‌سازی آنالایزر
+            # ------------------------------------------------------------
             logger.info("🧠 در حال هماهنگ‌سازی تنظیمات آنالایزر با استراتژی SMC...")
-            self.analyzer_config = self.config.get_full_config_for_analyzer()
-
-            if "ANALYZER_SETTINGS" not in self.analyzer_config:
-                self.analyzer_config["ANALYZER_SETTINGS"] = self.config.get("technical_settings")
-
-            tech_settings = self.analyzer_config.get("ANALYZER_SETTINGS", {})
+    
+            try:
+                self.analyzer_config = self.config.get_full_config_for_analyzer()
+            except Exception:
+                # fallback حداقلی
+                self.analyzer_config = {
+                    "ANALYZER_SETTINGS": self.config.get("technical_settings", {}) if hasattr(self.config, "get") else {},
+                    "TRADING_SESSIONS": {},
+                }
+    
+            if "ANALYZER_SETTINGS" not in self.analyzer_config or not isinstance(self.analyzer_config.get("ANALYZER_SETTINGS"), dict):
+                self.analyzer_config["ANALYZER_SETTINGS"] = self.config.get("technical_settings", {})
+    
+            tech_settings = self.analyzer_config.get("ANALYZER_SETTINGS", {}) or {}
+            try:
+                adx_weak = self.config.get("technical_settings.ADX_THRESHOLD_WEAK", tech_settings.get("ADX_THRESHOLD_WEAK"))
+            except Exception:
+                adx_weak = tech_settings.get("ADX_THRESHOLD_WEAK")
+    
             analyzer_settings = {
                 **tech_settings,
-                "ADX_THRESHOLD_WEAK": self.config.get("technical_settings.ADX_THRESHOLD_WEAK"),
+                "ADX_THRESHOLD_WEAK": adx_weak,
                 "REAL_TIME_ENABLED": True,
                 "USE_CURRENT_PRICE_FOR_ANALYSIS": True,
             }
             self.analyzer_config = {**self.analyzer_config, "ANALYZER_SETTINGS": analyzer_settings}
-
+    
+            # ------------------------------------------------------------
             # 7) ایجاد Risk Manager
-            scalping_config = {
-                "risk_manager_config": self.config.get_risk_manager_config(),
-                "trading_rules": {
-                    "MIN_CANDLES_BETWEEN": self.config.get("trading_rules.MIN_CANDLES_BETWEEN"),
-                },
-                "risk_settings": {
-                    "MAX_PRICE_DEVIATION_PIPS": self.config.get("risk_settings.MAX_PRICE_DEVIATION_PIPS"),
-                },
-            }
-            self.risk_manager = create_scalping_risk_manager(overrides=scalping_config)
-
+            #    توجه: اینجا فقط از bot_config.json می‌خوانیم و overrides را جمع‌وجور نگه می‌داریم.
+            # ------------------------------------------------------------
+            try:
+                scalping_config = {
+                    "risk_manager_config": self.config.get_risk_manager_config() if hasattr(self.config, "get_risk_manager_config") else {},
+                    "trading_rules": {
+                        "MIN_CANDLES_BETWEEN": self.config.get("trading_rules.MIN_CANDLES_BETWEEN", 3),
+                    },
+                    "risk_settings": {
+                        "MAX_PRICE_DEVIATION_PIPS": self.config.get("risk_settings.MAX_PRICE_DEVIATION_PIPS", 50.0),
+                    },
+                }
+                self.risk_manager = create_scalping_risk_manager(overrides=scalping_config)
+            except Exception as e:
+                logger.error(f"⚠️ RiskManager creation failed: {e}", exc_info=True)
+                # fallback حداقلی (اگر تابع اجازه دهد)
+                self.risk_manager = create_scalping_risk_manager(overrides={})
+    
             logger.info("✅ ربات با موفقیت عملیاتی شد.")
-            self._log_real_time_status()
-
-            # بازیابی/مانیتور اولیه (فقط برای همگام‌سازی)
-            logger.info("🔄 همگام‌سازی اولیه وضعیت معاملات با MT5...")
-            self._maybe_monitor_trades(force=True)
-
+            try:
+                self._log_real_time_status()
+            except Exception:
+                pass
+    
+            # ------------------------------------------------------------
+            # 8) همگام‌سازی اولیه وضعیت معاملات با MT5 (در صورت وجود)
+            # ------------------------------------------------------------
+            try:
+                logger.info("🔄 همگام‌سازی اولیه وضعیت معاملات با MT5...")
+                self._maybe_monitor_trades(force=True)
+            except Exception as e:
+                logger.warning(f"⚠️ Initial trade sync failed: {e}")
+    
             return True
-
+    
         except Exception as e:
             logger.critical(f"❌ خطای بحرانی در Initialize: {e}", exc_info=True)
             return False
+
 
     def _log_real_time_status(self):
         """🔥 گزارش وضعیت واقعی و داینامیک سیستم"""
