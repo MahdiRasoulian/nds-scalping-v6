@@ -691,6 +691,7 @@ class GoldNDSAnalyzer:
         session_analysis: SessionAnalysis,
     ) -> Tuple[float, List[str], Dict[str, Any]]:
         """سیستم امتیازدهی سازگار با وزن‌های مشخص"""
+        settings = self.GOLD_SETTINGS
         weights = {
             'structure': 30,
             'trend': 20,
@@ -856,6 +857,50 @@ class GoldNDSAnalyzer:
             weights[name] * breakdown['sub_scores'][name]
             for name in weights
         )
+
+        # --- Structure sanity dampening (prevents fake trends / weak confirmations) ---
+        # اگر هیچ BOS/CHOCH نداریم و ADX هم پایین است، اجازه ندهیم امتیاز به ناحیه سیگنال نزدیک شود.
+        try:
+            sanity_adx_max = float(settings.get('SANITY_ADX_MAX', 18.0))
+            sanity_damp = float(settings.get('SANITY_NO_BOS_CHOCH_DAMP', 0.55))
+            sanity_min_structure = float(settings.get('SANITY_MIN_STRUCTURE_SCORE', 35.0))
+        except Exception:
+            sanity_adx_max, sanity_damp, sanity_min_structure = 18.0, 0.55, 35.0
+
+        no_confirm = (getattr(structure, "bos", "NONE") == "NONE" and getattr(structure, "choch", "NONE") == "NONE")
+        weak_adx = adx_value < sanity_adx_max
+        weak_struct = structure_score < sanity_min_structure
+
+        if no_confirm and weak_adx:
+            applied_damp = sanity_damp * (0.8 if weak_struct else 1.0)  # اگر ساختار هم ضعیف است، کمی سخت‌تر
+            total_weighted *= applied_damp
+            breakdown.setdefault('modifiers', {})
+            breakdown['modifiers']['sanity_no_bos_choch'] = {
+                'applied': True,
+                'adx': round(adx_value, 2),
+                'structure_score': round(structure_score, 2),
+                'damp': round(applied_damp, 3),
+                'reason': 'no BOS/CHOCH with low ADX',
+            }
+            self._append_reason(
+                reasons,
+                f"⚠️ Weak confirmation (no BOS/CHOCH, ADX: {adx_value:.1f}) → score dampened"
+            )
+            self._log_debug(
+                "[NDS][SANITY] dampened total_weighted by %.3f (no_confirm=%s weak_adx=%s weak_struct=%s)",
+                applied_damp,
+                no_confirm,
+                weak_adx,
+                weak_struct,
+            )
+        else:
+            breakdown.setdefault('modifiers', {})
+            breakdown['modifiers']['sanity_no_bos_choch'] = {
+                'applied': False,
+                'adx': round(adx_value, 2),
+                'structure_score': round(structure_score, 2),
+            }
+
         score = 50.0 + 0.5 * total_weighted
 
         score = max(0.0, min(100.0, score))
@@ -882,51 +927,96 @@ class GoldNDSAnalyzer:
         scalping_mode: bool = True,
         sweeps: Optional[list] = None,
     ) -> float:
-        """محاسبه اعتماد سیگنال"""
+        """محاسبه اعتماد سیگنال
+
+        نکته عملیاتی:
+        - این تابع باید کاملاً قابل ردیابی (traceable) باشد تا هر ناسازگاری بین SCORE و CONFIDENCE
+          در لاگ‌ها سریعاً قابل کشف باشد.
+        """
+        # --- Base from score distance to neutral (50) ---
         base_confidence = abs(normalized_score - 50) * 2.4
 
+        # --- Volatility adjustment ---
         volatility_state = self._normalize_volatility_state(volatility_state)
+        vol_mult = 1.0
         if volatility_state == 'HIGH_VOLATILITY':
-            base_confidence *= 1.1 if scalping_mode else 0.8
+            vol_mult = 1.1 if scalping_mode else 0.8
         elif volatility_state == 'LOW_VOLATILITY':
-            base_confidence *= 0.9 if scalping_mode else 1.2
+            vol_mult = 0.9 if scalping_mode else 1.05
+        base_confidence *= vol_mult
 
-        if session_analysis.optimal_trading:
-            base_confidence *= 1.1
-        elif session_analysis.weight < 0.8:
-            is_strong_signal = normalized_score > 85 or normalized_score < 15
-            session_penalty = 0.95 if is_strong_signal else 0.75
-            base_confidence *= session_penalty
+        # --- Session adjustment ---
+        session_mult = 1.0
+        session_name = getattr(session_analysis, "current_session", "UNKNOWN")
+        session_weight = float(getattr(session_analysis, "session_weight", 1.0) or 1.0)
+        is_active_session = bool(getattr(session_analysis, "is_active_session", True))
 
-        current_rvol = float(volume_analysis.get('rvol', 1.0))
-        if pd.isna(current_rvol):
-            current_rvol = 1.0
-        if current_rvol > 2.0:
-            base_confidence *= 1.25
-        elif current_rvol < 0.5:
-            base_confidence *= 0.6
+        if session_weight < 0.6:
+            # در سشن‌های کم‌وزن (معمولاً ASIA) محافظه‌کارتر باش
+            session_mult *= 0.75
+
+        # strong_signal guard: فقط زمانی معتبر است که تحلیلگر واقعاً سیگنال قوی داشته باشد
+        # (اگر upstream مقدار دیگری پاس دهد، instrumentation کمک می‌کند سریع کشف شود)
+        strong_signal = abs(normalized_score - 50) > 15
+        if strong_signal and session_weight > 0.8:
+            session_mult *= 1.15
+        if not is_active_session:
+            session_mult *= 0.8
+
+        base_confidence *= session_mult
+
+        # --- RVOL adjustment ---
+        rvol_mult = 1.0
+        current_rvol = float(volume_analysis.get('current_rvol', 1.0) or 1.0)
+        if current_rvol > 1.2:
+            rvol_mult *= 1.1
         elif current_rvol < 0.8:
-            base_confidence *= 0.9
+            rvol_mult *= 0.9
+        base_confidence *= rvol_mult
 
-        if sweeps:
-            for sweep in sweeps:
-                sweep_type = getattr(sweep, 'type', None)
-                if normalized_score > 55 and sweep_type == 'BEARISH_SWEEP':
-                    base_confidence *= 0.8
-                elif normalized_score > 55 and sweep_type == 'BULLISH_SWEEP':
-                    base_confidence *= 1.15
-                elif normalized_score < 45 and sweep_type == 'BULLISH_SWEEP':
-                    base_confidence *= 0.8
-                elif normalized_score < 45 and sweep_type == 'BEARISH_SWEEP':
-                    base_confidence *= 1.15
+        # --- Sweep bonus (contextual) ---
+        sweep_mult = 1.0
+        sweeps_count = len(sweeps) if sweeps else 0
+        if sweeps_count > 0 and strong_signal:
+            sweep_mult *= 1.05
+            base_confidence *= sweep_mult
 
-        volume_trend = volume_analysis.get('volume_trend', 'NEUTRAL')
-        if volume_trend == 'INCREASING' and current_rvol > 1.0:
-            base_confidence = min(95, base_confidence * 1.1)
-
-        confidence = min(95, max(10, base_confidence))
+        # --- Range compression penalty (if near-neutral) ---
+        range_penalty_mult = 1.0
         if 42 <= normalized_score <= 58:
-            confidence *= 0.5
+            range_penalty_mult = 0.5
+            base_confidence *= range_penalty_mult
+
+        # --- Clamp ---
+        confidence = min(95, base_confidence * 1.1)
+        confidence = max(10, confidence)
+
+        # --- Instrumentation (single-line, deterministic, parse-friendly) ---
+        try:
+            self._log_debug(
+                "[NDS][CONF] score=%.2f base=%.2f vol=%s vol_mult=%.3f "
+                "session=%s weight=%.2f active=%s strong=%s session_mult=%.3f "
+                "rvol=%.2f rvol_mult=%.3f sweeps=%d sweep_mult=%.3f "
+                "range_mult=%.3f -> conf=%.2f",
+                float(normalized_score),
+                float(abs(normalized_score - 50) * 2.4),
+                volatility_state,
+                float(vol_mult),
+                session_name,
+                float(session_weight),
+                bool(is_active_session),
+                bool(strong_signal),
+                float(session_mult),
+                float(current_rvol),
+                float(rvol_mult),
+                int(sweeps_count),
+                float(sweep_mult),
+                float(range_penalty_mult),
+                float(confidence),
+            )
+        except Exception:
+            # لاگ نباید باعث fail شدن آنالیز شود
+            pass
 
         return round(confidence, 1)
 
@@ -1125,6 +1215,32 @@ class GoldNDSAnalyzer:
             structure = analysis_result.get('structure', {})
             structure_score = float(structure.get('structure_score', 0.0))
             min_structure_score = settings.get('MIN_STRUCTURE_SCORE', 20.0)
+
+
+            # --- Hard structure sanity gate (scalping) ---
+            # اگر BOS/CHOCH نداریم و ADX پایین است، حتی با score متوسط اجازه سیگنال نده.
+            market_metrics = analysis_result.get('market_metrics', {})
+            adx_v = float(market_metrics.get('adx', 0.0) or 0.0)
+            bos_v = structure.get('bos', 'NONE')
+            choch_v = structure.get('choch', 'NONE')
+
+            sanity_reject_adx_max = float(settings.get('SANITY_ADX_REJECT_MAX', 18.0))
+            sanity_reject_structure = float(settings.get('SANITY_STRUCTURE_REJECT_SCORE', 40.0))
+
+            if scalping_mode and analysis_result.get('signal', 'NONE') != 'NONE':
+                if bos_v == 'NONE' and choch_v == 'NONE' and adx_v < sanity_reject_adx_max and structure_score < sanity_reject_structure:
+                    analysis_result['signal'] = 'NONE'
+                    self._append_reason(
+                        reasons,
+                        f"Rejected: no BOS/CHOCH with low ADX (ADX: {adx_v:.1f}, structure: {structure_score:.1f})"
+                    )
+                    self._log_debug(
+                        "[NDS][FILTER][SANITY] reject no_confirm adx=%.2f structure=%.2f (max_adx=%.2f min_struct=%.2f)",
+                        adx_v,
+                        structure_score,
+                        sanity_reject_adx_max,
+                        sanity_reject_structure,
+                    )
 
             self._log_debug(
                 "[NDS][FILTER] structure score=%.1f min=%.1f",
