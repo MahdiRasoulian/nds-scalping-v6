@@ -939,70 +939,141 @@ class SMCAnalyzer:
         """
         محاسبه امتیاز کیفیت ساختار - نسخه بهینه شده برای اسکلپینگ چابک طلا
         """
+        # NOTE: این تابع یکی از حساس‌ترین نقاط تولید Score است.
+        # برای traceability، بدون تغییر منطق امتیازدهی، breakdown هر جزء را track می‌کنیم.
         score = 0.0
+        _parts: Dict[str, float] = {}
+        def _add_part(name: str, delta: float) -> None:
+            """Internal helper for INFO-level score breakdown (must not affect scoring)."""
+            try:
+                _parts[name] = float(_parts.get(name, 0.0)) + float(delta)
+            except Exception:
+                pass
         current_price = float(self.df['close'].iloc[-1])
 
         adx_threshold = self.GOLD_SETTINGS.get('ADX_THRESHOLD_WEAK', 15)
 
         score += 5.0
+        _add_part("base", 5.0)
 
         if bos != "NONE":
-            score += 45 * confidence
+            bos_component = 45 * confidence
+            score += bos_component
+            _add_part("bos_component", bos_component)
         elif choch != "NONE":
-            score += 35 * confidence
+            choch_component = 35 * confidence
+            score += choch_component
+            _add_part("choch_component", choch_component)
 
+        penetration_bonus = 0.0
         if last_high and current_price > last_high.price:
             penetration_bonus = 15.0 * (1.0 if confidence > 0.5 else 0.5)
             score += penetration_bonus
         elif last_low and current_price < last_low.price:
             penetration_bonus = 15.0 * (1.0 if confidence > 0.5 else 0.5)
             score += penetration_bonus
+        if penetration_bonus:
+            _add_part("penetration_bonus", penetration_bonus)
 
         if adx_value is not None:
+            adx_component = 0.0
             if adx_value > 25:
-                score += 12.0
+                adx_component = 12.0
             elif adx_value > adx_threshold:
-                score += 6.0
+                adx_component = 6.0
             else:
-                score -= 10.0
+                adx_component = -10.0
+            score += adx_component
+            _add_part("adx_component", adx_component)
 
         trend_score = 15 * trend_strength
         score += trend_score
+        _add_part("trend_component", trend_score)
 
         if volume_analysis:
             volume_zone = volume_analysis.get('volume_zone') or volume_analysis.get('zone', 'NORMAL')
+            volume_zone_component = 0.0
             if volume_zone == "HIGH":
-                score += 12
+                volume_zone_component = 12.0
             elif volume_zone == "NORMAL":
-                score += 6
+                volume_zone_component = 6.0
+            score += volume_zone_component
+            _add_part("volume_zone_component", volume_zone_component)
 
+        vol_component = 0.0
         if volatility_state == "MODERATE_VOLATILITY":
-            score += 8
+            vol_component = 8.0
         elif volatility_state == "HIGH_VOLATILITY":
-            score -= 8
+            vol_component = -8.0
         elif volatility_state == "LOW_VOLATILITY":
-            score -= 4
+            vol_component = -4.0
+        score += vol_component
+        _add_part("volatility_component", vol_component)
 
         if range_width and hasattr(self, 'atr') and self.atr > 0:
             atr_ratio = range_width / self.atr
+            range_component = 0.0
             if atr_ratio < 1.0:
-                score -= 8
+                range_component = -8.0
             elif atr_ratio > 1.5:
-                score += 8
+                range_component = 8.0
+            score += range_component
+            _add_part("range_component", range_component)
 
         if last_high is not None:
             score += 2.5
+            _add_part("swing_high_component", 2.5)
         if last_low is not None:
             score += 2.5
+            _add_part("swing_low_component", 2.5)
 
         if sweeps:
+            sweep_total = 0.0
             for sweep in sweeps:
                 if sweep.type == 'BULLISH_SWEEP':
-                    score += 8.0 * sweep.strength
+                    delta = 8.0 * sweep.strength
+                    score += delta
+                    sweep_total += delta
                 elif sweep.type == 'BEARISH_SWEEP':
-                    score -= 8.0 * sweep.strength
+                    delta = -8.0 * sweep.strength
+                    score += delta
+                    sweep_total += delta
+            _add_part("sweeps_component", sweep_total)
 
         final_score = max(0.0, min(100.0, score))
+        # clamp delta helps identify if score is saturating
+        _add_part("clamp_delta", final_score - score)
+
+        # INFO breakdown log (single-line, parse-friendly)
+        try:
+            self._log_info(
+                "[NDS][SMC][STRUCTURE_SCORE] bos=%s choch=%s conf=%.3f trend_strength=%.3f vol_state=%s "
+                "parts(base=%.2f bos=%.2f choch=%.2f pen=%.2f adx=%.2f trend=%.2f vzone=%.2f vol=%.2f range=%.2f "
+                "swh=%.2f swl=%.2f sweeps=%.2f clamp=%.2f) raw=%.2f final=%.2f",
+                str(bos),
+                str(choch),
+                float(confidence),
+                float(trend_strength),
+                str(volatility_state),
+                float(_parts.get("base", 0.0)),
+                float(_parts.get("bos_component", 0.0)),
+                float(_parts.get("choch_component", 0.0)),
+                float(penetration_bonus),
+                float(_parts.get("adx_component", 0.0)),
+                float(_parts.get("trend_component", 0.0)),
+                float(_parts.get("volume_zone_component", 0.0)),
+                float(_parts.get("volatility_component", 0.0)),
+                float(_parts.get("range_component", 0.0)),
+                float(_parts.get("swing_high_component", 0.0)),
+                float(_parts.get("swing_low_component", 0.0)),
+                float(_parts.get("sweeps_component", 0.0)),
+                float(_parts.get("clamp_delta", 0.0)),
+                float(score),
+                float(final_score),
+            )
+        except Exception:
+            pass
+
         return round(final_score, 2)
 
     def _get_relevant_swings(self, major_swings: List[SwingPoint], lookback: int) -> List[SwingPoint]:
