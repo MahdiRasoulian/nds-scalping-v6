@@ -344,12 +344,9 @@ class NDSBot:
             # ------------------------------------------------------------
             # 6.1) ایجاد نمونه آنالایزر (GoldNDSAnalyzer) با کانفیگ نهایی
             # ------------------------------------------------------------
-            try:
-                self.analyzer = GoldNDSAnalyzer(config=self.analyzer_config, logger=logger)
-                logger.info("✅ GoldNDSAnalyzer instance created and configured")
-            except Exception as e:
-                self.analyzer = None
-                logger.warning(f"⚠️ Failed to create GoldNDSAnalyzer instance: {e}", exc_info=True)
+            self.analyzer = None  # مسیر A: analyzer instance نمی‌سازیم؛ از analyze_gold_market استفاده می‌کنیم
+            logger.info("✅ Analyzer will be used via module function analyze_gold_market (no instance in initialize).")
+
 
             # ------------------------------------------------------------
             # 7) ایجاد Risk Manager
@@ -490,32 +487,40 @@ Bid: {current_price.get('bid', 0.0):.2f} | Ask: {current_price.get('ask', 0.0):.
             logger.info("🧠 اجرای تحلیل NDS اسکلپینگ...")
 
             try:
-                # اولویت: استفاده از instance آنالایزر ماژولار (GoldNDSAnalyzer)
-                if getattr(self, "analyzer", None) is not None:
-                    raw_result = self.analyzer.analyze_gold_market(df, timeframe=TIMEFRAME, mode="Scalping")
-                else:
-                    # سازگاری با نسخه‌های قدیمی: تلاش با امضای‌های مختلف
-                    if self.analyze_market_func is None:
-                        raise RuntimeError("Analyzer function is not available (analyze_market_func=None)")
-                    try:
-                        raw_result = self.analyze_market_func(
-                            dataframe=df,
-                            timeframe=TIMEFRAME,
-                            entry_factor=ENTRY_FACTOR,
-                            config=self.analyzer_config,
-                            scalping_mode=True,
-                        )
-                    except TypeError:
-                        # امضای جدیدتر (df,timeframe,mode)
-                        raw_result = self.analyze_market_func(df, timeframe=TIMEFRAME, mode="Scalping")
+                # مسیر A (پیشنهادی): همیشه از تابع ماژول analyze_gold_market استفاده کن
+                if self.analyze_market_func is None:
+                    raise RuntimeError("Analyzer function is not available (analyze_market_func=None)")
+
+                try:
+                    raw_result = self.analyze_market_func(
+                        dataframe=df,
+                        timeframe=TIMEFRAME,
+                        entry_factor=ENTRY_FACTOR,
+                        config=self.analyzer_config,
+                        scalping_mode=True,
+                    )
+                except TypeError:
+                    # برخی نسخه‌ها ممکن است امضای متفاوت داشته باشند
+                    raw_result = self.analyze_market_func(
+                        df,
+                        timeframe=TIMEFRAME,
+                        entry_factor=ENTRY_FACTOR,
+                        config=self.analyzer_config,
+                        scalping_mode=True,
+                    )
 
                 result = self._result_to_dict(raw_result)
                 if not result:
                     logger.warning("❌ تحلیل نتیجه خالی برگرداند")
                     return
+
             except Exception as e:
                 logger.error(f"❌ خطا در اجرای تحلیل: {e}", exc_info=True)
                 return
+
+
+
+
 
             # نرمال‌سازی سیگنال
             result["signal"] = self._normalize_signal(result.get("signal", "NONE"))
