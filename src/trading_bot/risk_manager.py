@@ -448,7 +448,7 @@ class ScalpingRiskManager:
         lot_size = self._calculate_scalping_lot_size(entry_price, stop_loss, risk_amount, sl_distance)
 
         # 11. محاسبات مالی
-        contract_size = float(self._get_gold_spec('contract_size', self.GOLD_SPECS.get('contract_size', 100.0)))
+        contract_size = float(self._get_gold_spec('contract_size', 100.0))
         position_value = lot_size * contract_size * entry_price
         margin_required = self._calculate_scalping_margin(lot_size, entry_price)
         actual_risk = self._calculate_actual_scalping_risk(lot_size, entry_price, stop_loss)
@@ -614,43 +614,11 @@ class ScalpingRiskManager:
                 reject_reason="Risk settings missing from config."
             )
 
-        # Cast numeric inputs for safety
-        try:
-            planned_entry = float(planned_entry)
-            stop_loss = float(stop_loss)
-            take_profit = float(take_profit)
-            bid = float(bid)
-            ask = float(ask)
-            confidence = float(confidence)
-            max_deviation_pips = float(max_deviation_pips)
-            limit_min_confidence = float(limit_min_confidence)
-            min_rr_ratio = float(min_rr_ratio)
-        except Exception:
-            return FinalizedOrderParams(
-                signal=signal,
-                order_type='NONE',
-                symbol=symbol,
-                entry_price=planned_entry or 0.0,
-                stop_loss=stop_loss or 0.0,
-                take_profit=take_profit or 0.0,
-                lot_size=0.0,
-                risk_amount_usd=0.0,
-                rr_ratio=0.0,
-                deviation_pips=0.0,
-                decision_notes=["Invalid numeric values in analysis/live/config."],
-                is_trade_allowed=False,
-                reject_reason="Numeric casting failed."
-            )
-
         market_entry = ask if signal == 'BUY' else bid
         deviation = abs(planned_entry - market_entry)
 
         gold_specs = self._normalize_gold_specs(trading_settings.get('GOLD_SPECIFICATIONS', {}))
-        point_size = gold_specs.get('point') or self.GOLD_SPECS.get('point') or self._get_gold_spec('point', 0.01)
-        try:
-            point_size = float(point_size)
-        except Exception:
-            point_size = 0.01
+        point_size = gold_specs.get('point') or self._get_gold_spec('point', 0.01)
         deviation_pips = deviation / point_size if point_size else deviation
 
         order_type = 'MARKET'
@@ -691,15 +659,26 @@ class ScalpingRiskManager:
         market_metrics = analysis_payload.get('market_metrics') or analysis_context.get('market_metrics', {})
         atr_value = market_metrics.get('atr_short') or market_metrics.get('atr')
 
-        if atr_value and max_entry_atr_deviation is not None:
-            try:
-                atr_value = float(atr_value)
-                max_entry_atr_deviation = float(max_entry_atr_deviation)
-            except Exception:
-                atr_value = None
+        # ===============================
+        # ✅ FIX: inject last signal context for can_scalp session gating
+        # ===============================
+        try:
+            self.last_signal_confidence = float(confidence) if confidence is not None else 0.0
+        except Exception:
+            self.last_signal_confidence = 0.0
 
-        if atr_value and atr_value > 0 and max_entry_atr_deviation is not None:
-            atr_deviation = deviation / atr_value
+        adx_val = market_metrics.get('adx')
+        if adx_val is None:
+            # تلاش برای پیدا کردن ADX در payloadهای دیگر (اگر موجود باشد)
+            adx_val = analysis_payload.get('adx') or analysis_context.get('adx')
+
+        try:
+            self.last_adx = float(adx_val) if adx_val is not None else 0.0
+        except Exception:
+            self.last_adx = 0.0
+
+        if atr_value and max_entry_atr_deviation is not None:
+            atr_deviation = deviation / atr_value if atr_value > 0 else 0.0
             if atr_deviation > max_entry_atr_deviation:
                 decision_notes.append(
                     f"Entry deviation {atr_deviation:.2f} ATR > max {max_entry_atr_deviation:.2f}."
@@ -766,13 +745,7 @@ class ScalpingRiskManager:
                 reject_reason="RR ratio below minimum."
             )
 
-        # ✅ Equity/balance fallback (به جای فقط ACCOUNT_BALANCE)
-        account_equity = (
-            config.get('ACCOUNT_EQUITY')
-            or config.get('ACCOUNT_BALANCE')
-            or trading_settings.get('ACCOUNT_EQUITY')
-            or trading_settings.get('ACCOUNT_BALANCE')
-        )
+        account_equity = config.get('ACCOUNT_BALANCE')
         max_risk_usd = risk_settings.get('RISK_AMOUNT_USD')
         if account_equity is None or max_risk_usd is None:
             return FinalizedOrderParams(
@@ -786,29 +759,9 @@ class ScalpingRiskManager:
                 risk_amount_usd=0.0,
                 rr_ratio=rr_ratio,
                 deviation_pips=deviation_pips,
-                decision_notes=["Missing account balance/equity or risk amount in config."],
+                decision_notes=["Missing account balance or risk amount in config."],
                 is_trade_allowed=False,
                 reject_reason="Risk amount settings missing."
-            )
-
-        try:
-            account_equity = float(account_equity)
-            max_risk_usd = float(max_risk_usd)
-        except Exception:
-            return FinalizedOrderParams(
-                signal=signal,
-                order_type='NONE',
-                symbol=symbol,
-                entry_price=entry_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                lot_size=0.0,
-                risk_amount_usd=0.0,
-                rr_ratio=rr_ratio,
-                deviation_pips=deviation_pips,
-                decision_notes=["Invalid numeric account equity/risk amount."],
-                is_trade_allowed=False,
-                reject_reason="Risk amount settings invalid."
             )
 
         current_session = self.get_current_scalping_session()
@@ -842,33 +795,32 @@ class ScalpingRiskManager:
                 reject_reason="Risk validation failed."
             )
 
-        # ✅ consistent lot clamps (normalized)
-        min_lot = gold_specs.get('min_lot') or self._get_gold_spec('min_lot', 0.01)
-        max_lot_spec = gold_specs.get('max_lot') or self._get_gold_spec('max_lot', 50.0)
+        # ===============================
+        # ✅ FIX: support both upper/lower keys for MIN/MAX lot
+        # ===============================
+        min_lot = (
+            gold_specs.get('min_lot')
+            or gold_specs.get('MIN_LOT')
+            or self._get_gold_spec('min_lot', 0.01)
+        )
+        max_lot_spec = (
+            gold_specs.get('max_lot')
+            or gold_specs.get('MAX_LOT')
+            or self._get_gold_spec('max_lot', 50.0)
+        )
+
         max_lot_limit = risk_manager_config.get('MAX_LOT_SIZE')
         lot_size = risk_params.lot_size
 
-        try:
-            if min_lot is not None and lot_size < float(min_lot):
-                decision_notes.append(f"Lot clamped to min {float(min_lot)}.")
-                lot_size = float(min_lot)
-        except Exception:
-            pass
+        if min_lot is not None and lot_size < float(min_lot):
+            decision_notes.append(f"Lot clamped to min {min_lot}.")
+            lot_size = float(min_lot)
 
         if max_lot_limit is not None:
-            try:
-                max_lot_limit = float(max_lot_limit)
-            except Exception:
-                max_lot_limit = None
-
-        if max_lot_limit is not None:
-            try:
-                max_lot = min(float(max_lot_spec), float(max_lot_limit)) if max_lot_spec is not None else float(max_lot_limit)
-                if max_lot is not None and lot_size > max_lot:
-                    decision_notes.append(f"Lot clamped to max {max_lot}.")
-                    lot_size = max_lot
-            except Exception:
-                pass
+            max_lot = min(float(max_lot_spec), float(max_lot_limit)) if max_lot_spec is not None else float(max_lot_limit)
+            if max_lot is not None and lot_size > max_lot:
+                decision_notes.append(f"Lot clamped to max {max_lot}.")
+                lot_size = max_lot
 
         decision_notes.append(
             f"Final entry {entry_price:.2f} SL {stop_loss:.2f} TP {take_profit:.2f} lot {lot_size:.3f}."
@@ -1050,12 +1002,7 @@ class ScalpingRiskManager:
 
         # استفاده از تنظیمات مپ شده برای حداکثر حجم
         max_lot_limit = self.settings.get('MAX_LOT_SIZE', 2.0)
-        try:
-            max_lot_limit = float(max_lot_limit)
-        except Exception:
-            max_lot_limit = 2.0
-
-        max_lot = min(max_lot_spec, max_lot_limit)
+        max_lot = min(max_lot_spec, float(max_lot_limit))
 
         if calculated_lot > max_lot * 0.5:
             calculated_lot = max_lot * 0.5
@@ -1068,11 +1015,7 @@ class ScalpingRiskManager:
         contract_size = float(self._get_gold_spec('contract_size', 100.0))
         contract_value = float(lot_size) * contract_size * float(entry_price)
         leverage = self.settings.get('MAX_LEVERAGE', 50)
-        try:
-            leverage = float(leverage)
-        except Exception:
-            leverage = 50.0
-        margin = contract_value / leverage if leverage > 0 else contract_value
+        margin = contract_value / leverage if leverage else contract_value
         return margin * 1.05
 
     def _calculate_actual_scalping_risk(self, lot_size: float, entry_price: float,
@@ -1144,16 +1087,11 @@ class ScalpingRiskManager:
             self.consecutive_losses += 1
             loss_count = self.scalping_stats['total_scalps'] - self.scalping_stats['winning_scalps']
             if loss_count > 0:
-                self.scalping_stats['avg_loss'] = (
-                    (self.scalping_stats['avg_loss'] * (loss_count - 1) + abs(profit_loss)) / loss_count
-                )
+                self.scalping_stats['avg_loss'] = ((self.scalping_stats['avg_loss'] * (loss_count - 1) + abs(profit_loss)) / loss_count)
             if profit_loss < self.scalping_stats['worst_scalp']:
                 self.scalping_stats['worst_scalp'] = profit_loss
 
-        self.scalping_stats['avg_duration'] = (
-            (self.scalping_stats['avg_duration'] * (self.scalping_stats['total_scalps'] - 1) + duration_minutes)
-            / self.scalping_stats['total_scalps']
-        )
+        self.scalping_stats['avg_duration'] = ((self.scalping_stats['avg_duration'] * (self.scalping_stats['total_scalps'] - 1) + duration_minutes) / self.scalping_stats['total_scalps'])
         self.trades_today += 1
         self.active_positions = max(0, self.active_positions - 1)
 
@@ -1201,33 +1139,35 @@ class ScalpingRiskManager:
             reasons.append(f"Daily trade limit: {self.trades_today}/{max_trades}")
 
         # ===============================
-        # 5. Scalping Session Handling (FIXED)
+        # 5. Scalping Session Handling (FIXED / ENFORCED)
         # ===============================
         current_session = self.get_current_scalping_session()
 
-        if not self.is_scalping_friendly_session(current_session):
+        # ✅ CRITICAL FIX:
+        # چون is_scalping_friendly_session('DEAD_ZONE') == True است،
+        # باید منطق DEAD_ZONE را جداگانه و صریح enforce کنیم؛ وگرنه override هیچوقت اجرا نمی‌شود.
+        if current_session == 'DEAD_ZONE':
+            confidence = getattr(self, 'last_signal_confidence', 0.0)
+            adx = getattr(self, 'last_adx', 0.0)
 
-            # ===== DEAD_ZONE OVERRIDE =====
-            if current_session == 'DEAD_ZONE':
-                confidence = getattr(self, 'last_signal_confidence', 0.0)
-                adx = getattr(self, 'last_adx', 0.0)
+            if confidence >= 65.0 and adx >= 20.0:
+                # ✅ اجازه معامله در DEAD_ZONE
+                self.session_risk_multiplier = 0.4
 
-                if confidence >= 65.0 and adx >= 20.0:
-                    # ✅ اجازه معامله در DEAD_ZONE
-                    self.session_risk_multiplier = 0.4
-
-                    # ✅ FIX: self.logger وجود ندارد، باید self._logger استفاده شود
-                    self._logger.info(
-                        f"🔥 DEAD_ZONE override accepted | "
-                        f"Confidence={confidence:.1f}% | ADX={adx:.1f}"
-                    )
-                else:
-                    reasons.append(f"Non-optimal session: {current_session}")
+                # ✅ FIX: self.logger وجود ندارد، باید self._logger استفاده شود
+                self._logger.info(
+                    f"🔥 DEAD_ZONE override accepted | "
+                    f"Confidence={confidence:.1f}% | ADX={adx:.1f}"
+                )
             else:
+                reasons.append(f"Non-optimal session: {current_session}")
+        else:
+            # سایر سشن‌ها طبق منطق قبلی
+            if not self.is_scalping_friendly_session(current_session):
                 reasons.append(f"Non-optimal session: {current_session}")
 
         # ===============================
-        # 6. Final Decision (CRITICAL FIX)
+        # 6. Final Decision
         # ===============================
         if reasons:
             return False, " | ".join(reasons)
