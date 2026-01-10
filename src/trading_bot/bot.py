@@ -865,7 +865,7 @@ class NDSBot:
             return False
 
         # ------------------------------------------------------------
-        # Guardrail: اعتبارسنجی هندسه معامله
+        # Guardrail #1: اعتبارسنجی هندسه معامله (Analyzer output)
         # ------------------------------------------------------------
         try:
             entry, sl, tp = self._extract_trade_levels(signal_data)
@@ -933,6 +933,23 @@ class NDSBot:
                 print(f"❌ RiskManager معامله را رد کرد: {finalized.reject_reason}")
                 return False
 
+            # ------------------------------------------------------------
+            # Guardrail #2: اعتبارسنجی هندسه معامله (Finalized output)
+            # ------------------------------------------------------------
+            try:
+                ok2, reason2 = self._validate_trade_geometry(
+                    signal_data.get("signal", "NONE"),
+                    float(finalized.entry_price),
+                    float(finalized.stop_loss),
+                    float(finalized.take_profit),
+                )
+                if not ok2:
+                    logger.error("❌ Invalid trade geometry after RiskManager finalize | %s", reason2)
+                    print(f"❌ هندسه معامله بعد از RiskManager نامعتبر است: {reason2}")
+                    return False
+            except Exception as g2_err:
+                logger.warning(f"⚠️ Post-finalize geometry validation failed unexpectedly: {g2_err}", exc_info=True)
+
             signal_data.update(
                 {
                     "final_entry": finalized.entry_price,
@@ -970,8 +987,6 @@ class NDSBot:
 
             order_result = None
 
-            # MT5Client شما send_order_real_time دارد و dict برمی‌گرداند.
-            # Pending هم send_limit_order / send_pending_order را دارد.
             if str(order_type).lower() == "market":
                 if hasattr(self.mt5_client, "send_order_real_time"):
                     order_result = self.mt5_client.send_order_real_time(
@@ -1038,7 +1053,6 @@ class NDSBot:
                 success = bool(order_result.get("success"))
                 order_id = order_result.get("order_ticket") or order_result.get("ticket")
                 position_ticket = order_result.get("position_ticket")
-                # در send_order_real_time مقادیر entry/sl/tp برمی‌گردند
                 actual_entry_price = float(order_result.get("entry_price", actual_entry_price) or actual_entry_price)
                 actual_sl = float(order_result.get("stop_loss", actual_sl) or actual_sl)
                 actual_tp = float(order_result.get("take_profit", actual_tp) or actual_tp)
@@ -1056,10 +1070,10 @@ class NDSBot:
                     position_ticket,
                     SYMBOL,
                     signal_data["signal"],
-                    actual_entry_price,
-                    actual_sl,
-                    actual_tp,
-                    lot_size,
+                    float(actual_entry_price),
+                    float(actual_sl),
+                    float(actual_tp),
+                    float(lot_size),
                     order_type,
                 )
                 print(f"✅ سفارش {order_type} ارسال شد - ticket={order_id} | حجم: {lot_size:.3f} لات")
@@ -1096,33 +1110,26 @@ class NDSBot:
                     },
                 }
                 self.trade_tracker.add_trade_open(open_event)
-
                 self.bot_state.add_trade(success=True)
 
-                # برای candle-based cooldown، اینجا datetime.now نگذار (در run_analysis_cycle set می‌شود)
-                # اگر df نبود، حداقل local زمان را بگذار
                 if df is None or df.empty:
                     self.bot_state.last_trade_wall_time = datetime.now()
                     self.bot_state.last_trade_time = self.bot_state.last_trade_wall_time
 
-                # آپدیت ریسک منیجر
                 if hasattr(self.risk_manager, "add_position"):
                     self.risk_manager.add_position(lot_size)
 
-                # گزارش اجرا
                 generate_execution_report(
                     logger=logger,
                     event=open_event,
                     df=df,
                 )
 
-                # تلگرام
                 try:
                     self.notifier.send_signal_notification(params=signal_data, symbol=SYMBOL)
                 except Exception as t_err:
                     logger.warning(f"⚠️ خطای غیربحرانی در ارسال تلگرام: {t_err}", exc_info=True)
 
-                # مانیتورینگ فوری بعد از باز شدن
                 self._maybe_monitor_trades(force=True)
                 return True
 
@@ -1136,6 +1143,7 @@ class NDSBot:
             print(f"❌ خطا در اجرای معامله اسکلپینگ Real-Time: {e}")
             self.bot_state.add_trade(success=False)
             return False
+
 
     def execute_trade(self, signal_data: dict, df=None) -> bool:
         """سازگاری با کدهای قدیمی"""
