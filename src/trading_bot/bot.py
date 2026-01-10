@@ -216,6 +216,11 @@ class NDSBot:
         if ctx and isinstance(ctx.get("session"), dict) and "session_analysis" not in d:
             d["session_analysis"] = ctx.get("session")
 
+        # ✅ NEW: analyzer most likely stores it here
+        if ctx and isinstance(ctx.get("session_analysis"), dict) and "session_analysis" not in d:
+            d["session_analysis"] = ctx.get("session_analysis")
+
+
         if "scalping_mode" not in d:
             d["scalping_mode"] = True
 
