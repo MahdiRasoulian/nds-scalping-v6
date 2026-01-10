@@ -64,6 +64,7 @@ class GoldNDSAnalyzer:
         self.timeframe = self._detect_timeframe()
         self._apply_timeframe_settings()
 
+        self._score_hist = _SCORE_HIST
 
         self._log_info(
             "[NDS][INIT] initialized candles=%s timeframe=%s",
@@ -1081,19 +1082,19 @@ class GoldNDSAnalyzer:
         C_MAX = 85.0
 
         # z-edge mapping
-        Z0 = 0.9       # زیر 1σ: edge ضعیف
-        KZ = 0.45       # شیب sigmoid برای z
+        Z0 = 0.8
+        KZ = 0.45
 
-        # neutral softness (جایگزین if 42..58)
-        D0 = 4.5        # آستانه فاصله از 50
-        KD = 2.0        # شیب
-        NEUTRAL_FLOOR = 0.55  # کف جریمه نزدیک 50 (نه 0.5 تهاجمی)
+        # neutral softness
+        D0 = 4.5
+        KD = 2.0
+        NEUTRAL_FLOOR = 0.55
 
         # penalty strengths
         ALPHA_SESSION = 0.70
         ALPHA_RVOL = 0.55
         ALPHA_NEUTRAL = 0.75
-        ALPHA_VOL = 0.40      # اثر volatility را هم نرم کنید
+        ALPHA_VOL = 0.40
 
         # soft-floor shaping
         FLOOR = 2.0
@@ -1111,7 +1112,7 @@ class GoldNDSAnalyzer:
         vol_mult_s = self._safe_mult(vol_mult)
 
         # ------------------------------
-        # Session multiplier (same policy, but we will apply softly)
+        # Session multiplier (soft)
         # ------------------------------
         session_name = str(getattr(session_analysis, "current_session", "UNKNOWN") or "UNKNOWN")
         session_weight = float(getattr(session_analysis, "session_weight", 1.0) or 1.0)
@@ -1166,7 +1167,7 @@ class GoldNDSAnalyzer:
         session_mult_s = self._safe_mult(session_mult)
 
         # ------------------------------
-        # RVOL multiplier (same idea but soft)
+        # RVOL multiplier (soft)
         # ------------------------------
         rvol_mult = 1.0
         current_rvol = volume_analysis.get('rvol', 1.0)
@@ -1183,33 +1184,29 @@ class GoldNDSAnalyzer:
         rvol_mult_s = self._safe_mult(rvol_mult)
 
         # ------------------------------
-        # Neutral softness (score نزدیک 50 را نرم penalize کن)
-        # replaces hard if 42..58 => 0.5
+        # Neutral softness
         # ------------------------------
         d = abs(score - 50.0)
-        neutral_mult = NEUTRAL_FLOOR + (1.0 - NEUTRAL_FLOOR) * self._sigmoid((d - D0) / KD)
+        neutral_mult = NEUTRAL_FLOOR + (1.0 - NEUTRAL_FLOOR) * _sigmoid((d - D0) / KD)
         neutral_mult_s = self._safe_mult(neutral_mult)
 
         # ------------------------------
         # Z-score history (probability of edge)
+        # ✅ از history shared استفاده می‌کنیم
         # ------------------------------
-        hist = list(_SCORE_HIST)
+        hist = list(self._score_hist)
 
-        # اگر history نداریم، fall back به یک mapping ساده روی |score-50|
-        # (تا راه بیفتد و بعد با history دقیق شود)
         if len(hist) >= 30:
             mu = mean(hist)
-            sigma = pstdev(hist)  # std
-            sigma = max(1.0, float(sigma))  # کف برای جلوگیری از z انفجاری
+            sigma = pstdev(hist)
+            sigma = max(1.0, float(sigma))
             z = (score - float(mu)) / sigma
             z_edge = abs(z)
             p_edge = self._sigmoid((z_edge - Z0) / KZ)
             conf_raw = C_MIN + (C_MAX - C_MIN) * p_edge
             z_mode = f"hist(n={len(hist)})"
         else:
-            # fallback: هنوز history کافی نیست
-            # این را طوری می‌گذاریم که نزدیک 50 پایین باشد و بعداً history جایگزین شود
-            p_edge = self._sigmoid((d - 6.0) / 2.5)  # دقت کمتر، فقط برای warmup
+            p_edge = self._sigmoid((d - 6.0) / 2.5)
             conf_raw = C_MIN + (C_MAX - C_MIN) * p_edge
             mu = 50.0
             sigma = 0.0
@@ -1218,7 +1215,7 @@ class GoldNDSAnalyzer:
             z_mode = f"warmup(n={len(hist)})"
 
         # ------------------------------
-        # Apply penalties in exponent/log-space (equivalent)
+        # Apply penalties
         # ------------------------------
         vol_eff = vol_mult_s ** ALPHA_VOL
         session_eff = session_mult_s ** ALPHA_SESSION
@@ -1229,7 +1226,7 @@ class GoldNDSAnalyzer:
         conf_pen = conf_raw * combined_eff
 
         # ------------------------------
-        # Sweep bonus (اگر واقعاً لازم دارید: خیلی نرم)
+        # Sweep bonus (soft)
         # ------------------------------
         sweeps_count = len(sweeps) if sweeps else 0
         sweep_mult = 1.0
@@ -1238,21 +1235,21 @@ class GoldNDSAnalyzer:
             conf_pen *= sweep_mult
 
         # ------------------------------
-        # Soft-floor final (no hard clamp to 10)
+        # Soft-floor final
         # ------------------------------
         conf_final = self._soft_floor_rational(conf_pen, floor=FLOOR, cap=C_MAX, t=T)
         conf_final = self._clamp(0.0, conf_final, 100.0)
 
         # ------------------------------
-        # Update history AFTER computation (avoid leakage)
+        # ✅ Update history AFTER computation (shared)
         # ------------------------------
         try:
-            _SCORE_HIST.append(score)
+            self._score_hist.append(score)
         except Exception:
             pass
 
         # ------------------------------
-        # Logging (auditable, parse-friendly)
+        # Logging
         # ------------------------------
         try:
             reasons_str = ",".join(untradable_reasons) if untradable_reasons else "-"
