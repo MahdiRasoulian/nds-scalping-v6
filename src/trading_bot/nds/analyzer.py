@@ -1187,7 +1187,7 @@ class GoldNDSAnalyzer:
         # Neutral softness
         # ------------------------------
         d = abs(score - 50.0)
-        neutral_mult = NEUTRAL_FLOOR + (1.0 - NEUTRAL_FLOOR) * _sigmoid((d - D0) / KD)
+        neutral_mult = NEUTRAL_FLOOR + (1.0 - NEUTRAL_FLOOR) * self._sigmoid((d - D0) / KD)
         neutral_mult_s = self._safe_mult(neutral_mult)
 
         # ------------------------------
