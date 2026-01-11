@@ -7,6 +7,6 @@
   "trading_rules.MIN_CANDLES_BETWEEN_TRADES": 10,
   "risk_settings.MAX_PRICE_DEVIATION_PIPS": 50,
   "risk_settings.RISK_AMOUNT_USD": 35,
-  "technical_settings.SCALPING_BUY_THRESHOLD": 51,
-  "technical_settings.SCALPING_SELL_THRESHOLD": 49
+  "technical_settings.SCALPING_BUY_THRESHOLD": 50.2,
+  "technical_settings.SCALPING_SELL_THRESHOLD": 49.8
 }

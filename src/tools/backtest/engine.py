@@ -6,29 +6,30 @@ Design goals:
 - Candle-by-candle simulation (walk-forward) with reproducible records for analysis
 - Parameter override friendly (grid search / random search)
 - Produces a detailed trades ledger + equity curve + per-cycle diagnostics
-- **Anti-lookahead / anti-leakage**:
-    * Analysis at bar i only sees candles up to i (inclusive).
-    * Any new order decided at bar i is **executed no earlier than bar i+1**.
-    * SL/TP evaluation is done using subsequent bars only.
-    * For LIMIT orders: order is placed at i, then filled only if future bars reach the limit price.
 
-Expected OHLCV input (from loader; Excel/CSV):
-time, open, high, low, close, volume (or tick_volume)
+Expected OHLCV input (CSV):
+time, open, high, low, close, tick_volume (or volume)
 Time must be parseable by pandas.to_datetime.
 
 Notes:
-- Bid/Ask are synthesized using spread (in price units, e.g., 0.25$). You may pass a fixed spread.
+- Bid/Ask are synthesized using spread (in price units, e.g., 0.25$). You may pass a fixed spread
+  or a spread series (e.g., from MT5 ticks aggregated).
 - SL/TP are evaluated intra-bar using high/low:
     BUY: SL hits if low <= SL; TP hits if high >= TP
     SELL: SL hits if high >= SL; TP hits if low <= TP
   If both hit in same bar, we apply a conservative rule: SL first (worst-case).
+
+Anti-lookahead / Anti-leakage:
+- Walk-forward candle-by-candle.
+- For each bar i, analyzer only receives window up to i (inclusive).
+- No future bars are exposed to analyzer or risk sizing.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 
 import pandas as pd
@@ -88,18 +89,16 @@ class Position:
     symbol: str
     open_time: pd.Timestamp
     open_bar_index: int
-
     entry_price: float
     stop_loss: float
     take_profit: float
     lot: float
-
     order_type: str  # MARKET/LIMIT (simulated)
-
     confidence: float
     score: float
     rr: float
     session: str
+    planned_entry: float
     deviation_pips: float
     notes: List[str]
 
@@ -113,23 +112,16 @@ class Position:
 
 @dataclass
 class PendingOrder:
-    """
-    Pending order that is created at decision bar i and can only fill on bars > i.
-    For MARKET orders, we force-fill on i+1 open (worst-case: spread + slippage).
-    For LIMIT orders, we fill when the limit price is touched by future bar high/low.
-    """
     id: str
+    side: str  # BUY / SELL
+    symbol: str
     created_time: pd.Timestamp
     created_bar_index: int
-
-    side: str
-    symbol: str
-    order_type: str  # MARKET / LIMIT
-    limit_price: Optional[float]  # for LIMIT, the target price
+    planned_entry: float
     stop_loss: float
     take_profit: float
     lot: float
-
+    order_type: str  # LIMIT
     confidence: float
     score: float
     rr: float
@@ -137,8 +129,31 @@ class PendingOrder:
     deviation_pips: float
     notes: List[str]
 
-    expires_bar_index: int  # inclusive expiry; if current bar index > expires -> cancel
-    reject_reason: Optional[str] = None
+    # filled info
+    filled_time: Optional[pd.Timestamp] = None
+    filled_bar_index: Optional[int] = None
+    filled_price: Optional[float] = None
+
+    def to_position(self) -> Position:
+        return Position(
+            id=self.id,
+            side=self.side,
+            symbol=self.symbol,
+            open_time=self.filled_time or self.created_time,
+            open_bar_index=self.filled_bar_index if self.filled_bar_index is not None else self.created_bar_index,
+            entry_price=float(self.filled_price if self.filled_price is not None else self.planned_entry),
+            stop_loss=float(self.stop_loss),
+            take_profit=float(self.take_profit),
+            lot=float(self.lot),
+            order_type=str(self.order_type),
+            confidence=float(self.confidence),
+            score=float(self.score),
+            rr=float(self.rr),
+            session=str(self.session),
+            planned_entry=float(self.planned_entry),
+            deviation_pips=float(self.deviation_pips),
+            notes=list(self.notes or []),
+        )
 
 
 @dataclass
@@ -151,7 +166,7 @@ class BacktestConfig:
     warmup_bars: int = 300  # minimum bars before allowing trades
     spread: float = 0.25    # price units ($)
     slippage: float = 0.10  # price units ($) - applied on entry/exit
-    commission_per_lot: float = 0.0  # USD per lot, per side
+    commission_per_lot: float = 0.0  # USD per lot, round-turn handled as two sides
 
     # governance
     allow_multiple_positions: bool = True
@@ -160,13 +175,13 @@ class BacktestConfig:
     min_time_between_trades_minutes: int = 150
     daily_max_trades: int = 40
 
+    # pending order simulation
+    enable_limit_orders: bool = True
+    pending_expire_minutes: int = 60  # cancel pending if not filled within this time
+
     # risk
     starting_equity: float = 1000.0
     max_daily_risk_percent: float = 6.0
-
-    # pending orders
-    market_fill_next_bar_only: bool = True  # enforce anti-lookahead
-    limit_expiry_bars: int = 6              # how many bars a LIMIT can wait before cancel (conservative)
 
     # meta
     random_seed: int = 7
@@ -219,6 +234,7 @@ def _pnl_usd_gold(side: str, entry: float, exit_: float, lot: float, contract_si
     For spot gold CFD/FX, common approximation:
       PnL = (exit - entry) * contract_size * lot   for BUY
       PnL = (entry - exit) * contract_size * lot   for SELL
+    Contract size in your config is 100.
     """
     if side == "BUY":
         return (exit_ - entry) * contract_size * lot
@@ -238,7 +254,7 @@ def _apply_slippage(price: float, side: str, is_entry: bool, slippage: float) ->
     return price - slippage if side == "BUY" else price + slippage
 
 
-def _bar_hit(side: str, h: float, l: float, sl: float, tp: float) -> Tuple[Optional[str], Optional[float]]:
+def _bar_hit(side: str, o: float, h: float, l: float, c: float, sl: float, tp: float) -> Tuple[Optional[str], Optional[float]]:
     """
     Determine if TP/SL is hit inside a bar. Worst-case ordering when both hit in same bar.
     """
@@ -264,15 +280,15 @@ def _bar_hit(side: str, h: float, l: float, sl: float, tp: float) -> Tuple[Optio
         return None, None
 
 
-def _limit_touched(side: str, h: float, l: float, limit_price: float) -> bool:
+def _limit_fill(side: str, planned_entry: float, o: float, h: float, l: float) -> bool:
     """
-    Conservative limit fill check:
-      BUY LIMIT fills if low <= limit_price
-      SELL LIMIT fills if high >= limit_price
+    Simple limit fill model:
+      BUY LIMIT fills if low <= entry
+      SELL LIMIT fills if high >= entry
     """
     if side == "BUY":
-        return l <= limit_price
-    return h >= limit_price
+        return l <= planned_entry
+    return h >= planned_entry
 
 
 # -----------------------------
@@ -306,8 +322,8 @@ class NDSBacktester:
 
         self.rng = np.random.default_rng(self.bt.random_seed)
 
-        # RiskManager uses internal config.settings; finalize_order also accepts config dict
-        self.risk_manager = ScalpingRiskManager(overrides=None)
+        self.risk_manager = ScalpingRiskManager(overrides=None)  # uses config.settings internally
+        # but finalize_order expects a config dict; we pass self.bot_config each call
 
         self.positions: List[Position] = []
         self.pending: List[PendingOrder] = []
@@ -320,7 +336,7 @@ class NDSBacktester:
 
         self._daily_trades = 0
         self._daily_pnl = 0.0
-        self._daily_risk_used = 0.0  # approximate using risk_amount_usd
+        self._daily_risk_used = 0.0  # approximate using planned risk_amount_usd
         self._current_day: Optional[pd.Timestamp] = None
 
         # caches for outputs
@@ -338,8 +354,7 @@ class NDSBacktester:
         self._current_day = day
 
     def _can_open_new(self, now: pd.Timestamp, bar_index: int) -> Tuple[bool, str]:
-        # Note: pending orders count as "intent" but do not consume max_positions until filled.
-        if not self.bt.allow_multiple_positions and (self.positions or self.pending):
+        if not self.bt.allow_multiple_positions and self.positions:
             return False, "WAIT_FOR_CLOSE_BEFORE_NEW_TRADE"
 
         if len(self.positions) >= self.bt.max_positions:
@@ -365,12 +380,7 @@ class NDSBacktester:
 
         return True, "OK"
 
-    def _synthesize_live_from_close(self, close_price: float, now: pd.Timestamp) -> Dict[str, Any]:
-        """
-        Live snapshot used by RiskManager. For anti-lookahead:
-        - In backtest we treat this as the snapshot at the *end* of decision bar i.
-        - Execution (fill) happens on bar i+1.
-        """
+    def _synthesize_live(self, close_price: float) -> Dict[str, Any]:
         half = float(self.bt.spread) / 2.0
         bid = float(close_price) - half
         ask = float(close_price) + half
@@ -380,14 +390,14 @@ class NDSBacktester:
             "last": float(close_price),
             "spread": float(self.bt.spread),
             "source": "backtest_synth",
-            "timestamp": pd.Timestamp(now).to_pydatetime().isoformat(),
+            "timestamp": datetime.utcnow().isoformat(),
         }
 
     def _close_position(self, pos: Position, now: pd.Timestamp, bar_index: int, exit_price: float, reason: str):
         exit_exec = _apply_slippage(exit_price, pos.side, is_entry=False, slippage=self.bt.slippage)
         pnl = _pnl_usd_gold(pos.side, pos.entry_price, exit_exec, pos.lot, contract_size=self.contract_size)
 
-        # commissions (close side; open side was applied at fill time)
+        # commissions (one side on open + one side on close)
         pnl -= float(self.bt.commission_per_lot) * float(pos.lot)
 
         pos.close_time = now
@@ -404,120 +414,61 @@ class NDSBacktester:
 
         self._trade_rows.append(asdict(pos))
 
-    def _fill_market_order_next_bar(self, po: PendingOrder, now: pd.Timestamp, bar_index: int, bar_open: float):
-        """
-        Force market fill on bar_open (i+1). Conservative:
-        - BUY fills at ask (open + half spread) + slippage
-        - SELL fills at bid (open - half spread) - slippage
-        """
-        half = float(self.bt.spread) / 2.0
-        if po.side == "BUY":
-            raw_entry = float(bar_open) + half
-        else:
-            raw_entry = float(bar_open) - half
+    def _expire_pending(self, now: pd.Timestamp):
+        if not self.pending:
+            return
+        expire_minutes = int(self.bt.pending_expire_minutes or 0)
+        if expire_minutes <= 0:
+            return
+        keep: List[PendingOrder] = []
+        for po in self.pending:
+            age_min = (now - po.created_time).total_seconds() / 60.0
+            if age_min >= expire_minutes:
+                # expired -> drop silently (you can add a cycle log field if you want)
+                continue
+            keep.append(po)
+        self.pending = keep
 
-        entry_exec = _apply_slippage(raw_entry, po.side, is_entry=True, slippage=self.bt.slippage)
-
-        # apply open-side commission
-        open_comm = float(self.bt.commission_per_lot) * float(po.lot)
-
-        # Create position
-        pos = Position(
-            id=po.id,
-            side=po.side,
-            symbol=po.symbol,
-            open_time=now,
-            open_bar_index=bar_index,
-            entry_price=float(entry_exec),
-            stop_loss=float(po.stop_loss),
-            take_profit=float(po.take_profit),
-            lot=float(po.lot),
-            order_type="MARKET",
-            confidence=float(po.confidence),
-            score=float(po.score),
-            rr=float(po.rr),
-            session=str(po.session),
-            deviation_pips=float(po.deviation_pips),
-            notes=list(po.notes) + [f"filled_market_on_bar_open idx={bar_index}"],
-        )
-        self.positions.append(pos)
-
-        # debit open commission immediately
-        self.balance -= open_comm
-        self.equity = self.balance
-
-        self.last_trade_time = now
-        self.last_trade_bar_index = bar_index
-        self._daily_trades += 1
-
-    def _try_fill_limit_order(self, po: PendingOrder, now: pd.Timestamp, bar_index: int, h: float, l: float) -> bool:
-        """
-        Fill LIMIT if touched by current bar.
-        Conservative: fill at limit price with adverse slippage.
-        """
-        if po.limit_price is None:
-            return False
-
-        if not _limit_touched(po.side, h=h, l=l, limit_price=float(po.limit_price)):
-            return False
-
-        entry_exec = _apply_slippage(float(po.limit_price), po.side, is_entry=True, slippage=self.bt.slippage)
-
-        # apply open-side commission
-        open_comm = float(self.bt.commission_per_lot) * float(po.lot)
-
-        pos = Position(
-            id=po.id,
-            side=po.side,
-            symbol=po.symbol,
-            open_time=now,
-            open_bar_index=bar_index,
-            entry_price=float(entry_exec),
-            stop_loss=float(po.stop_loss),
-            take_profit=float(po.take_profit),
-            lot=float(po.lot),
-            order_type="LIMIT",
-            confidence=float(po.confidence),
-            score=float(po.score),
-            rr=float(po.rr),
-            session=str(po.session),
-            deviation_pips=float(po.deviation_pips),
-            notes=list(po.notes) + [f"filled_limit idx={bar_index}"],
-        )
-        self.positions.append(pos)
-
-        self.balance -= open_comm
-        self.equity = self.balance
-
-        self.last_trade_time = now
-        self.last_trade_bar_index = bar_index
-        self._daily_trades += 1
-        return True
+    def _try_fill_pending(self, now: pd.Timestamp, bar_index: int, o: float, h: float, l: float):
+        if not self.pending:
+            return
+        filled: List[PendingOrder] = []
+        keep: List[PendingOrder] = []
+        for po in self.pending:
+            if _limit_fill(po.side, po.planned_entry, o, h, l):
+                po.filled_time = now
+                po.filled_bar_index = bar_index
+                # conservative fill price: planned entry + slippage on entry
+                fill_exec = _apply_slippage(float(po.planned_entry), po.side, is_entry=True, slippage=self.bt.slippage)
+                po.filled_price = float(fill_exec)
+                filled.append(po)
+            else:
+                keep.append(po)
+        self.pending = keep
+        for po in filled:
+            self.positions.append(po.to_position())
+            self.last_trade_time = now
+            self.last_trade_bar_index = bar_index
+            self._daily_trades += 1
 
     def run(self, df: pd.DataFrame) -> BacktestResult:
         """
-        Anti-lookahead implementation notes:
-        - We assume df is time-sorted ascending.
-        - We evaluate exits on current bar for positions opened in prior bars.
-        - We decide new orders on bar i using history up to i (inclusive).
-        - We execute MARKET orders on bar i+1 open.
-        - We place LIMIT orders on bar i and fill them only if touched by bars > i.
+        df must be sorted ascending by time.
         """
         if df is None or df.empty:
             raise ValueError("OHLCV dataframe is empty.")
 
         df = df.copy()
-
-        # Normalize time index
         if "time" in df.columns:
             df["time"] = pd.to_datetime(df["time"])
             df = df.sort_values("time").reset_index(drop=True)
             df = df.set_index("time")
         else:
+            # assume index is datetime-like
             df.index = pd.to_datetime(df.index)
             df = df.sort_index()
 
-        # Normalize volume
+        # normalize volume column for analyzer compatibility
         if "volume" not in df.columns:
             if "tick_volume" in df.columns:
                 df["volume"] = df["tick_volume"]
@@ -532,13 +483,8 @@ class NDSBacktester:
         times = df.index.to_list()
         n = len(df)
 
-        # We need at least (warmup + 2) bars because decisions execute on i+1
-        if n < (self.bt.warmup_bars + 2):
-            raise ValueError(f"Not enough bars for warmup+execution. bars={n}, warmup={self.bt.warmup_bars}")
-
-        # Walk-forward loop: i is decision bar, i+1 is execution bar
-        # We also process exits & pending fills on each bar.
-        for i in range(0, n):
+        # rolling simulation
+        for i in range(n):
             now = times[i]
 
             # daily reset
@@ -546,73 +492,36 @@ class NDSBacktester:
             if self._current_day is None or day != self._current_day:
                 self._reset_daily(day)
 
-            # current bar OHLC
+            # update open positions first (intra-bar)
             o = float(df["open"].iloc[i])
             h = float(df["high"].iloc[i])
             l = float(df["low"].iloc[i])
             c = float(df["close"].iloc[i])
 
-            # 1) First, process fills of pending LIMITs on this bar (but only if bar_index > created_bar_index)
-            still_pending: List[PendingOrder] = []
-            for po in self.pending:
-                if i <= po.created_bar_index:
-                    still_pending.append(po)
-                    continue
+            # pending maintenance
+            self._expire_pending(now)
+            self._try_fill_pending(now, i, o, h, l)
 
-                # expiry
-                if i > po.expires_bar_index:
-                    # cancel silently; optionally log it in cycle_log
-                    continue
-
-                if po.order_type == "LIMIT":
-                    filled = self._try_fill_limit_order(po, now=now, bar_index=i, h=h, l=l)
-                    if not filled:
-                        still_pending.append(po)
-                else:
-                    # MARKET orders are forced fill only on next bar open; handled below.
-                    still_pending.append(po)
-            self.pending = still_pending
-
-            # 2) Process exits for open positions using this bar's high/low (intra-bar)
             still_open: List[Position] = []
             for pos in self.positions:
-                hit, level = _bar_hit(pos.side, h=h, l=l, sl=pos.stop_loss, tp=pos.take_profit)
+                hit, level = _bar_hit(pos.side, o, h, l, c, pos.stop_loss, pos.take_profit)
                 if hit:
                     self._close_position(pos, now, i, float(level), hit)
-                    continue
-
-                # optional timeout
-                timeout_min = _get_cfg(self.bot_config, "risk_manager_config.POSITION_TIMEOUT_MINUTES", None)
-                if timeout_min:
-                    bars_per_min = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60}
-                    tf = str(self.bt.timeframe).upper()
-                    bar_minutes = bars_per_min.get(tf, 15)
-                    max_bars = int(math.ceil(float(timeout_min) / float(bar_minutes)))
-                    if (i - pos.open_bar_index) >= max_bars:
-                        self._close_position(pos, now, i, c, "TIMEOUT")
-                        continue
-
-                still_open.append(pos)
+                else:
+                    # optional timeout based on risk_manager_config.POSITION_TIMEOUT_MINUTES
+                    timeout_min = _get_cfg(self.bot_config, "risk_manager_config.POSITION_TIMEOUT_MINUTES", None)
+                    if timeout_min:
+                        bars_per_min = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60}
+                        tf = str(self.bt.timeframe).upper()
+                        bar_minutes = bars_per_min.get(tf, 15)
+                        max_bars = int(math.ceil(float(timeout_min) / float(bar_minutes)))
+                        if (i - pos.open_bar_index) >= max_bars:
+                            self._close_position(pos, now, i, c, "TIMEOUT")
+                            continue
+                    still_open.append(pos)
             self.positions = still_open
 
-            # 3) Force-fill MARKET pending orders on THIS bar open, but only if created at i-1
-            # (anti-lookahead: no same-bar fills, no skipping)
-            market_pending_keep: List[PendingOrder] = []
-            for po in self.pending:
-                if po.order_type != "MARKET":
-                    market_pending_keep.append(po)
-                    continue
-
-                # fill only if this bar is exactly next bar after creation
-                if i == po.created_bar_index + 1:
-                    self._fill_market_order_next_bar(po, now=now, bar_index=i, bar_open=o)
-                else:
-                    # If missed the next bar (shouldn't happen), cancel to avoid hidden leakage.
-                    # Conservative: cancel.
-                    continue
-            self.pending = market_pending_keep
-
-            # 4) Record equity at each bar
+            # record equity each bar
             self._equity_rows.append(
                 {
                     "time": now,
@@ -625,37 +534,36 @@ class NDSBacktester:
                 }
             )
 
-            # 5) If not enough bars for warmup, skip decision
+            # warmup: require enough bars for indicators + score history
             if i < self.bt.warmup_bars:
                 continue
 
-            # 6) If i is last bar, we cannot create decisions (no i+1 to execute)
-            if i >= n - 1:
-                break
-
-            # 7) Analysis window up to current bar (inclusive) ONLY
+            # run analysis on a sliding window up to current bar (inclusive)
             window = df.iloc[max(0, i - self.bt.bars_to_fetch + 1): i + 1].copy()
-
-            # Analyzer expects a "time" column in some paths; we provide reset_index.
-            # Important: This reset_index contains no future rows beyond i.
             entry_factor = float(_get_cfg(self.bot_config, "technical_settings.ENTRY_FACTOR", 0.25) or 0.25)
 
             try:
+                # IMPORTANT FIX:
+                # Your analyze_gold_market signature does NOT accept analysis_only=...
+                # Passing that kwarg causes exception each cycle -> fallback score=50 forever.
                 raw = analyze_gold_market(
                     dataframe=window.reset_index(),
                     timeframe=self.bt.timeframe,
                     entry_factor=entry_factor,
                     config=self.bot_config,
                     scalping_mode=True,
-                    analysis_only=True,  # important: analyzer should not rely on execution side-effects
                 )
                 result = raw if isinstance(raw, dict) else (raw.__dict__ if hasattr(raw, "__dict__") else {})
+                if not isinstance(result, dict):
+                    result = {}
             except Exception as e:
                 result = {
                     "signal": "NONE",
                     "confidence": 0.0,
                     "score": 50.0,
                     "error": True,
+                    "analyzer_error": True,
+                    "analyzer_error_msg": str(e),
                     "reasons": [str(e)],
                     "context": {},
                 }
@@ -663,14 +571,12 @@ class NDSBacktester:
             analyzer_signal = _normalize_signal(result.get("signal"))
             score = float(result.get("score", 0.0) or 0.0)
             confidence = float(result.get("confidence", 0.0) or 0.0)
+
             min_conf = float(_get_cfg(self.bot_config, "technical_settings.SCALPING_MIN_CONFIDENCE", 38) or 38)
 
-            session = str(result.get("context", {}).get("session_analysis", {}).get("current_session", "UNKNOWN"))
+            live = self._synthesize_live(c)
 
-            # live snapshot from CLOSE of current bar i (known at decision time)
-            live = self._synthesize_live_from_close(c, now=now)
-
-            decision: Dict[str, Any] = {
+            decision = {
                 "cycle": i,
                 "time": now,
                 "analyzer_signal": analyzer_signal,
@@ -680,15 +586,25 @@ class NDSBacktester:
                 "close": c,
                 "open_positions": len(self.positions),
                 "pending_orders": len(self.pending),
+                "analyzer_error": False,
+                "analyzer_error_msg": "",
             }
 
-            # Bot-level gating similar to bot.py
+            # propagate analyzer exceptions (for diagnostics)
+            if bool(result.get("analyzer_error") or result.get("error")):
+                decision["analyzer_error"] = True
+                decision["analyzer_error_msg"] = str(
+                    result.get("analyzer_error_msg") or (result.get("reasons", [""])[0] if isinstance(result.get("reasons"), list) else "") or ""
+                )
+
+            # apply bot-level gate similar to bot.py (signal first)
             if analyzer_signal not in ("BUY", "SELL"):
                 decision["final_signal"] = "NONE"
                 decision["reject_reason"] = "ANALYZER_NONE"
                 self._cycle_rows.append(decision)
                 continue
 
+            # confidence gate
             if confidence < min_conf:
                 decision["final_signal"] = "NONE"
                 decision["reject_reason"] = "CONF_TOO_LOW"
@@ -702,7 +618,7 @@ class NDSBacktester:
                 self._cycle_rows.append(decision)
                 continue
 
-            # finalize order (market/limit, deviation, rr, lot sizing) using your RiskManager
+            # finalize (market/limit, deviation, rr, lot sizing)
             order = self.risk_manager.finalize_order(
                 analysis=result,
                 live=live,
@@ -711,87 +627,92 @@ class NDSBacktester:
             )
 
             order_d = order if isinstance(order, dict) else (order.__dict__ if hasattr(order, "__dict__") else {})
+            if not isinstance(order_d, dict):
+                order_d = {}
 
-            # RiskManager fields vary by version; support common keys
-            allowed = bool(order_d.get("is_trade_allowed", order_d.get("allowed", False)))
+            allowed = bool(order_d.get("is_trade_allowed", False))
 
-            final_signal = _normalize_signal(order_d.get("signal", analyzer_signal))
-            order_type = str(order_d.get("order_type", "MARKET")).upper()
-
-            decision["final_signal"] = final_signal
-            decision["order_type"] = order_type
+            decision["final_signal"] = _normalize_signal(order_d.get("signal"))
+            decision["order_type"] = order_d.get("order_type")
             decision["is_trade_allowed"] = allowed
             decision["reject_reason"] = order_d.get("reject_reason")
             decision["deviation_pips"] = float(order_d.get("deviation_pips", 0.0) or 0.0)
             decision["rr_ratio"] = float(order_d.get("rr_ratio", 0.0) or 0.0)
             self._cycle_rows.append(decision)
 
-            if not allowed or final_signal not in ("BUY", "SELL"):
+            if not allowed:
                 continue
 
-            # Extract order levels (support alternative key names)
-            entry_price = float(order_d.get("entry_price", order_d.get("planned_entry", c)) or c)
-            sl = float(order_d.get("stop_loss", order_d.get("sl_price", order_d.get("sl", 0.0))) or 0.0)
-            tp = float(order_d.get("take_profit", order_d.get("tp_price", order_d.get("tp", 0.0))) or 0.0)
-            lot = float(order_d.get("lot_size", order_d.get("lot", 0.0)) or 0.0)
+            side = _normalize_signal(order_d.get("signal"))
+            entry = float(order_d["entry_price"])
+            sl = float(order_d["stop_loss"])
+            tp = float(order_d["take_profit"])
+            lot = float(order_d["lot_size"])
+            order_type = str(order_d.get("order_type", "MARKET")).upper()
 
-            # Guard against invalid orders
-            if lot <= 0 or sl <= 0 or tp <= 0:
-                continue
-
+            pos_id = f"BT_{now.strftime('%Y%m%d_%H%M%S')}_{i}"
             notes = list(order_d.get("decision_notes") or [])
+            session = str(result.get("context", {}).get("session_analysis", {}).get("current_session", "UNKNOWN"))
 
-            po_id = f"BT_{now.strftime('%Y%m%d_%H%M%S')}_{i}"
-            expires = i + int(self.bt.limit_expiry_bars)
-
-            # MARKET: must fill on i+1 open
-            # LIMIT : wait until touched, up to expiry bars
-            if order_type.startswith("LIMIT"):
-                pending = PendingOrder(
-                    id=po_id,
+            if order_type == "LIMIT" and self.bt.enable_limit_orders:
+                po = PendingOrder(
+                    id=pos_id,
+                    side=side,
+                    symbol=self.bt.symbol,
                     created_time=now,
                     created_bar_index=i,
-                    side=final_signal,
-                    symbol=self.bt.symbol,
+                    planned_entry=float(entry),
+                    stop_loss=float(sl),
+                    take_profit=float(tp),
+                    lot=float(lot),
                     order_type="LIMIT",
-                    limit_price=float(entry_price),
-                    stop_loss=float(sl),
-                    take_profit=float(tp),
-                    lot=float(lot),
                     confidence=float(confidence),
                     score=float(score),
                     rr=float(order_d.get("rr_ratio", 0.0) or 0.0),
                     session=session,
                     deviation_pips=float(order_d.get("deviation_pips", 0.0) or 0.0),
-                    notes=notes + ["placed_limit_from_decision_bar"],
-                    expires_bar_index=expires,
+                    notes=notes,
                 )
-                self.pending.append(pending)
-            else:
-                pending = PendingOrder(
-                    id=po_id,
-                    created_time=now,
-                    created_bar_index=i,
-                    side=final_signal,
-                    symbol=self.bt.symbol,
-                    order_type="MARKET",
-                    limit_price=None,
-                    stop_loss=float(sl),
-                    take_profit=float(tp),
-                    lot=float(lot),
-                    confidence=float(confidence),
-                    score=float(score),
-                    rr=float(order_d.get("rr_ratio", 0.0) or 0.0),
-                    session=session,
-                    deviation_pips=float(order_d.get("deviation_pips", 0.0) or 0.0),
-                    notes=notes + ["placed_market_from_decision_bar", "fill_on_next_bar_open_only"],
-                    expires_bar_index=i + 1,  # must fill on next bar only; else cancel
-                )
-                self.pending.append(pending)
+                self.pending.append(po)
 
-            # approximate daily risk used = risk_amount_usd (if provided)
-            risk_used = float(order_d.get("risk_amount_usd", _get_cfg(self.bot_config, "risk_settings.RISK_AMOUNT_USD", 0.0) or 0.0) or 0.0)
-            self._daily_risk_used += max(0.0, risk_used)
+                # approximate daily risk used = risk_amount_usd
+                risk_used = float(order_d.get("risk_amount_usd", 0.0) or 0.0)
+                self._daily_risk_used += risk_used
+
+                # do NOT set last_trade_time here (filled later)
+                continue
+
+            # MARKET (default)
+            entry_exec = _apply_slippage(entry, side, is_entry=True, slippage=self.bt.slippage)
+
+            pos = Position(
+                id=pos_id,
+                side=side,
+                symbol=self.bt.symbol,
+                open_time=now,
+                open_bar_index=i,
+                entry_price=entry_exec,
+                stop_loss=sl,
+                take_profit=tp,
+                lot=lot,
+                order_type=str(order_d.get("order_type", "MARKET")),
+                confidence=confidence,
+                score=score,
+                rr=float(order_d.get("rr_ratio", 0.0) or 0.0),
+                session=session,
+                planned_entry=float(result.get("entry_price", entry) or entry),
+                deviation_pips=float(order_d.get("deviation_pips", 0.0) or 0.0),
+                notes=notes,
+            )
+            self.positions.append(pos)
+
+            self.last_trade_time = now
+            self.last_trade_bar_index = i
+            self._daily_trades += 1
+
+            # approximate daily risk used = risk_amount_usd
+            risk_used = float(order_d.get("risk_amount_usd", 0.0) or 0.0)
+            self._daily_risk_used += risk_used
 
         trades_df = pd.DataFrame(self._trade_rows)
         equity_df = pd.DataFrame(self._equity_rows).set_index("time")
@@ -815,7 +736,7 @@ class NDSBacktester:
 def compute_metrics(trades: pd.DataFrame, equity: pd.DataFrame, starting_equity: float) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "starting_equity": float(starting_equity),
-        "ending_equity": float(equity["equity"].iloc[-1]) if not equity.empty else float(starting_equity),
+        "ending_equity": float(equity["equity"].iloc[-1]) if equity is not None and not equity.empty else float(starting_equity),
         "net_pnl": 0.0,
         "total_trades": int(len(trades)) if trades is not None else 0,
         "win_rate": 0.0,

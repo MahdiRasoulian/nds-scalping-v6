@@ -12,10 +12,10 @@
     "min_candles_between_trades": 10,
     "min_time_between_trades_minutes": 150,
     "daily_max_trades": 40,
-    "starting_equity": 100.0,
+    "enable_limit_orders": true,
+    "pending_expire_minutes": 60,
+    "starting_equity": 873.53,
     "max_daily_risk_percent": 6.0,
-    "market_fill_next_bar_only": true,
-    "limit_expiry_bars": 6,
     "random_seed": 7
   },
   "bot_overrides": {
@@ -27,7 +27,7 @@
     "trading_rules.MIN_CANDLES_BETWEEN_TRADES": 10,
     "risk_settings.MAX_PRICE_DEVIATION_PIPS": 50,
     "risk_settings.RISK_AMOUNT_USD": 35,
-    "technical_settings.SCALPING_BUY_THRESHOLD": 51,
-    "technical_settings.SCALPING_SELL_THRESHOLD": 49
+    "technical_settings.SCALPING_BUY_THRESHOLD": 50.2,
+    "technical_settings.SCALPING_SELL_THRESHOLD": 49.8
   }
 }

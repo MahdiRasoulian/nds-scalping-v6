@@ -469,6 +469,8 @@ def run_optimization_job(
     # Best row
     if "error" in results.columns:
         ok = results[results["error"].fillna("") == ""]
+        if ok.empty:
+            raise RuntimeError("All grid runs failed (no successful rows). See grid_results.csv.")
         best_row = ok.iloc[0]
     else:
         best_row = results.iloc[0]
@@ -486,6 +488,36 @@ def run_optimization_job(
     best_res.trades.to_csv(os.path.join(out_dir, "best_trades.csv"), index=False, encoding="utf-8-sig")
     best_res.equity_curve.to_csv(os.path.join(out_dir, "best_equity_curve.csv"), encoding="utf-8-sig")
     best_res.cycle_log.to_csv(os.path.join(out_dir, "best_cycle_log.csv"), encoding="utf-8-sig")
+
+    # -------------------------------
+    # ✅ Score distribution (diagnostic)
+    # -------------------------------
+    cycles = best_res.cycle_log  # <-- FIX: this is the actual cycle dataframe
+
+    if cycles is not None and (not cycles.empty) and ("score" in cycles.columns):
+        s = pd.to_numeric(cycles["score"], errors="coerce").dropna()
+        if len(s):
+            print("[SCORE] min=", float(s.min()), "max=", float(s.max()))
+            print(
+                "[SCORE] p50=", float(s.quantile(0.50)),
+                "p90=", float(s.quantile(0.90)),
+                "p95=", float(s.quantile(0.95)),
+                "p99=", float(s.quantile(0.99)),
+            )
+            # optional: also write to file for review
+            try:
+                score_stats = {
+                    "min": float(s.min()),
+                    "max": float(s.max()),
+                    "p50": float(s.quantile(0.50)),
+                    "p90": float(s.quantile(0.90)),
+                    "p95": float(s.quantile(0.95)),
+                    "p99": float(s.quantile(0.99)),
+                    "count": int(len(s)),
+                }
+                _save_json(os.path.join(out_dir, "score_distribution.json"), score_stats)
+            except Exception:
+                pass
 
     _save_json(os.path.join(out_dir, "best_backtest_metrics.json"), best_res.metrics)
     _save_json(os.path.join(out_dir, "best_backtest_config.json"), {"bt_cfg": asdict(bt_cfg), "bot_overrides": best_overrides_flat})
@@ -506,6 +538,7 @@ def run_optimization_job(
         )
 
     return results
+
 
 
 def main():

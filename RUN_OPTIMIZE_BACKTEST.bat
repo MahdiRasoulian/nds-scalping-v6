@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 
-set ROOT=D:\Mahdi\New Backend\V-3\nds-scalping-v6
+set ROOT=E:\BourseAnalysis\nds-scalping-v6
 set CFG=%ROOT%\config\bot_config.json
 set GRID=%ROOT%\config\grid.json
 set OUT=%ROOT%\out_opt
@@ -30,7 +30,7 @@ python -m src.tools.backtest.optimize ^
   --config "%CFG%" ^
   --grid "%GRID%" ^
   --out "%OUT%" ^
-  --days 40
+  --days 30
 
 start "" "%OUT%"
 echo.

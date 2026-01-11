@@ -1114,12 +1114,30 @@ class GoldNDSAnalyzer:
         # ------------------------------
         # Session multiplier (soft)
         # ------------------------------
-        session_name = str(getattr(session_analysis, "current_session", "UNKNOWN") or "UNKNOWN")
-        session_weight = float(getattr(session_analysis, "session_weight", 1.0) or 1.0)
+        session_name = str(
+            getattr(session_analysis, "current_session", None)
+            or getattr(session_analysis, "session", None)
+            or getattr(session_analysis, "name", None)
+            or "UNKNOWN"
+        )
+
+        # IMPORTANT: support both 'session_weight' and 'weight'
+        _session_weight = (
+            getattr(session_analysis, "session_weight", None)
+            if getattr(session_analysis, "session_weight", None) is not None
+            else getattr(session_analysis, "weight", None)
+        )
+        try:
+            session_weight = float(_session_weight if _session_weight is not None else 1.0)
+        except Exception:
+            session_weight = 1.0
 
         upstream_active = bool(getattr(session_analysis, "is_active_session", True))
+
         session_activity = str(
-            getattr(session_analysis, "session_activity", getattr(session_analysis, "activity", "UNKNOWN")) or "UNKNOWN"
+            getattr(session_analysis, "session_activity", None)
+            or getattr(session_analysis, "activity", None)
+            or "UNKNOWN"
         ).upper()
 
         strong_signal = abs(score - 50) > 15
