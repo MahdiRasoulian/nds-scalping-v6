@@ -49,10 +49,10 @@ if __name__ == '__main__':
     # --- تنظیمات استخراج ---
     SYMBOL = "XAUUSD!"
     # تایم فریم مورد نظر (مثلاً 1 Hour)
-    TIMEFRAME = mt5.TIMEFRAME_M15 
+    TIMEFRAME = mt5.TIMEFRAME_M15
     # محدوده زمانی مورد نظر (مثلاً 1 سال گذشته)
-    START_DATE = datetime(2025, 12, 30)
-    END_DATE = datetime.now()
+    START_DATE = datetime(2025, 11, 1)
+    END_DATE = datetime(2026, 1, 9)
     
     # --- اجرای استخراج ---
     historical_data = extract_mt5_data(SYMBOL, TIMEFRAME, START_DATE, END_DATE)

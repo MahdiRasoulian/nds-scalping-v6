@@ -1284,33 +1284,88 @@ class GoldNDSAnalyzer:
 
 
     def _determine_signal(
-        self,
-        normalized_score: float,
-        confidence: float,
-        volatility_state: str,
-        scalping_mode: bool = True,
-    ) -> str:
-        """تعیین سیگنال با آستانه‌های پویا (بدون فیلتر اعتماد)"""
-        if scalping_mode:
-            volatility_state = self._normalize_volatility_state(volatility_state)
-            if volatility_state == 'HIGH_VOLATILITY':
-                buy_threshold = 60
-                sell_threshold = 40
-            elif volatility_state == 'LOW_VOLATILITY':
+            self,
+            normalized_score: float,
+            confidence: float,
+            volatility_state: str,
+            scalping_mode: bool = True,
+        ) -> str:
+            """تعیین سیگنال با آستانه‌های پویا (بدون فیلتر اعتماد)
+
+            نکته:
+            - آستانه‌های پیش‌فرض مطابق منطق قبلی حفظ شده‌اند.
+            - برای بک‌تست/آپتیمایز می‌توانید از طریق config این آستانه‌ها را override کنید:
+                technical_settings.SCALPING_BUY_THRESHOLD
+                technical_settings.SCALPING_SELL_THRESHOLD
+
+            همچنین برای جلوگیری از خطای انسانی (مثل گرید شما)، اگر این کلیدها را
+            اشتباهاً زیر trading_settings گذاشته باشید هم پشتیبانی می‌شود:
+                trading_settings.SCALPING_BUY_THRESHOLD
+                trading_settings.SCALPING_SELL_THRESHOLD
+            """
+            # --- Default thresholds (legacy behaviour)
+            if scalping_mode:
+                volatility_state = self._normalize_volatility_state(volatility_state)
+                if volatility_state == 'HIGH_VOLATILITY':
+                    buy_threshold = 60
+                    sell_threshold = 40
+                elif volatility_state == 'LOW_VOLATILITY':
+                    buy_threshold = 65
+                    sell_threshold = 35
+                else:
+                    buy_threshold = 55
+                    sell_threshold = 45
+            else:
                 buy_threshold = 65
                 sell_threshold = 35
-            else:
-                buy_threshold = 55
-                sell_threshold = 45
-        else:
-            buy_threshold = 65
-            sell_threshold = 35
 
-        if normalized_score >= buy_threshold:
-            return "BUY"
-        if normalized_score <= sell_threshold:
-            return "SELL"
-        return "NONE"
+            # --- Configurable overrides (keeps backward compatibility)
+            # We accept overrides in BOTH technical_settings and trading_settings to prevent misconfiguration.
+            try:
+                cfg = self.config if isinstance(self.config, dict) else {}
+                ts = cfg.get("technical_settings", {}) if isinstance(cfg.get("technical_settings", {}), dict) else {}
+                tr = cfg.get("trading_settings", {}) if isinstance(cfg.get("trading_settings", {}), dict) else {}
+
+                # prefer technical_settings; fallback to trading_settings
+                buy_ovr = ts.get("SCALPING_BUY_THRESHOLD", None)
+                sell_ovr = ts.get("SCALPING_SELL_THRESHOLD", None)
+
+                if buy_ovr is None:
+                    buy_ovr = tr.get("SCALPING_BUY_THRESHOLD", None)
+                if sell_ovr is None:
+                    sell_ovr = tr.get("SCALPING_SELL_THRESHOLD", None)
+
+                # allow numeric strings too
+                if buy_ovr is not None:
+                    buy_threshold = float(buy_ovr)
+                if sell_ovr is not None:
+                    sell_threshold = float(sell_ovr)
+            except Exception:
+                # never let config parsing break signal generation
+                pass
+
+            # Safety: ensure thresholds are sensible
+            try:
+                buy_threshold = float(buy_threshold)
+                sell_threshold = float(sell_threshold)
+            except Exception:
+                buy_threshold, sell_threshold = 55.0, 45.0
+
+            # If user misconfigures (e.g., buy <= sell), widen minimally to avoid degenerate logic
+            if buy_threshold <= sell_threshold:
+                mid = (buy_threshold + sell_threshold) / 2.0
+                buy_threshold = mid + 1.0
+                sell_threshold = mid - 1.0
+
+            if normalized_score >= buy_threshold:
+                return "BUY"
+            if normalized_score <= sell_threshold:
+                return "SELL"
+            return "NONE"
+
+
+
+
 
     def _build_initial_result(
         self,

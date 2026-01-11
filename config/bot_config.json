@@ -1,7 +1,7 @@
 {
   "bot_name": "NDS Trading Bot Pro",
   "version": "5.0",
-  "ACCOUNT_BALANCE": 1000,
+  "ACCOUNT_BALANCE": 873.53,
   "trading_rules": {
     "MIN_CANDLES_BETWEEN_TRADES": 10,
     "MAX_POSITIONS": 5,
@@ -49,7 +49,9 @@
       "TYPICAL_SPREAD": 0.25,
       "TYPICAL_SLIPPAGE": 0.1,
       "OVERNIGHT_FEE_LONG": -5.0,
-      "OVERNIGHT_FEE_SHORT": -8.0
+      "OVERNIGHT_FEE_SHORT": -8.0,
+      "SCALPING_BUY_THRESHOLD": 52,
+      "SCALPING_SELL_THRESHOLD": 48
     },
     "MODE": "live"
   },

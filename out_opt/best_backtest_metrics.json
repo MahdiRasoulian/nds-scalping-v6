@@ -1,0 +1,12 @@
+{
+  "starting_equity": 100.0,
+  "ending_equity": 100.0,
+  "net_pnl": 0.0,
+  "total_trades": 0,
+  "win_rate": 0.0,
+  "profit_factor": 0.0,
+  "max_drawdown": 0.0,
+  "avg_trade_pnl": 0.0,
+  "median_trade_pnl": 0.0,
+  "expectancy": 0.0
+}
